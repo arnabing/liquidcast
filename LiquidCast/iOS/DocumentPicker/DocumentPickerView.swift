@@ -64,7 +64,7 @@ struct FileBrowserSheet: View {
 
     var body: some View {
         DocumentPickerView(selectedURL: $selectedURL)
-            .onChange(of: selectedURL) { _, newURL in
+            .onChange(of: selectedURL) { newURL in
                 if let url = newURL {
                     appState.loadMedia(from: url)
                     appState.showingFilePicker = false

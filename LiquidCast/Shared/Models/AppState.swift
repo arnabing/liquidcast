@@ -1,6 +1,9 @@
 import SwiftUI
 import AVFoundation
 import Combine
+import os.log
+
+private let appStateLogger = Logger(subsystem: "com.liquidcast", category: "AppState")
 
 /// Quality mode for casting
 enum CastingMode: String, CaseIterable {
@@ -26,12 +29,58 @@ enum CastingMode: String, CaseIterable {
     }
 }
 
+/// Compatibility mode for different AirPlay receivers
+enum CompatibilityMode: String, CaseIterable, Codable {
+    case appleTV = "Apple TV"
+    case smartTV = "Smart TV"
+
+    var description: String {
+        switch self {
+        case .appleTV:
+            return "Best quality for Apple TV devices"
+        case .smartTV:
+            return "Compatible with Samsung, LG, and other smart TVs"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .appleTV:
+            return "appletv"
+        case .smartTV:
+            return "tv"
+        }
+    }
+
+    /// Auto-detect device type from device name
+    static func detect(from deviceName: String) -> CompatibilityMode {
+        let name = deviceName.lowercased()
+
+        // Apple TV indicators
+        if name.contains("apple") || name.contains("appletv") || name.contains("apple tv") {
+            return .appleTV
+        }
+
+        // Smart TV indicators (Samsung, LG, Sony, Vizio, TCL, Hisense, etc.)
+        let smartTVKeywords = ["samsung", "lg", "sony", "vizio", "tcl", "hisense", "roku", "fire", "chromecast"]
+        for keyword in smartTVKeywords {
+            if name.contains(keyword) {
+                return .smartTV
+            }
+        }
+
+        // Default to smartTV for maximum compatibility with unknown devices
+        return .smartTV
+    }
+}
+
 /// Main application state
 @MainActor
 class AppState: ObservableObject {
     // MARK: - Published Properties
 
     @Published var castingMode: CastingMode = .highestQuality
+    @Published var compatibilityMode: CompatibilityMode = .appleTV
     @Published var selectedMediaURL: URL?
     @Published var isPlaying: Bool = false
     @Published var isConnectedToAirPlay: Bool = false
@@ -42,21 +91,44 @@ class AppState: ObservableObject {
     @Published var playbackProgress: Double = 0.0
     @Published var duration: Double = 0.0
 
+    // MARK: - Conversion State
+
+    @Published var isConverting: Bool = false
+    @Published var conversionProgress: Double = 0.0
+    @Published var conversionStatus: String = ""
+    @Published var conversionError: String?
+
     // MARK: - Services
 
     let mediaPlayer = MediaPlayerController()
     let airPlayManager = AirPlayManager()
+    let transcodeManager = TranscodeManager()
+
+    // MARK: - Cache Cleanup Tracking
+
+    /// The converted file URL for the currently playing media (if any)
+    private var currentConvertedURL: URL?
+    /// Whether we've already cleaned up the current converted file
+    private var hasCleanedUpCurrentFile: Bool = false
+    /// Threshold for considering media "mostly watched" (80% = credits)
+    private let cleanupThreshold: Double = 0.80
+    /// Days after which cached files are automatically deleted
+    private let cacheExpirationDays: Int = 7
 
     // MARK: - Persistence Keys
 
     private let lastDeviceKey = "lastAirPlayDevice"
     private let lastModeKey = "lastCastingMode"
+    private let compatibilityModeKey = "compatibilityMode"
+    private let ultraQualityKey = "ultraQualityAudio"
 
     // MARK: - Initialization
 
     init() {
         loadPersistedSettings()
         setupBindings()
+        cleanupOldCacheFiles()
+        CacheManager.removeDuplicates()
     }
 
     // MARK: - Persistence
@@ -67,19 +139,48 @@ class AppState: ObservableObject {
             castingMode = mode
         }
 
+        if let savedCompatMode = UserDefaults.standard.string(forKey: compatibilityModeKey),
+           let mode = CompatibilityMode(rawValue: savedCompatMode) {
+            compatibilityMode = mode
+        }
+
         if let savedDevice = UserDefaults.standard.string(forKey: lastDeviceKey) {
             currentAirPlayDevice = savedDevice
         }
+
+        transcodeManager.ultraQualityAudio = UserDefaults.standard.bool(forKey: ultraQualityKey)
     }
 
     func saveCurrentDevice(_ deviceName: String?) {
         currentAirPlayDevice = deviceName
         UserDefaults.standard.set(deviceName, forKey: lastDeviceKey)
+
+        // Auto-detect and set compatibility mode based on device name
+        if let name = deviceName {
+            let detectedMode = CompatibilityMode.detect(from: name)
+            saveCompatibilityMode(detectedMode)
+            appStateLogger.info("📺 Device '\(name)' detected as: \(detectedMode.rawValue)")
+        }
+    }
+
+    /// Whether a device is available (connected or remembered) for file selection
+    var isDeviceReady: Bool {
+        isConnectedToAirPlay || currentAirPlayDevice != nil
     }
 
     func saveCastingMode(_ mode: CastingMode) {
         castingMode = mode
         UserDefaults.standard.set(mode.rawValue, forKey: lastModeKey)
+    }
+
+    func saveCompatibilityMode(_ mode: CompatibilityMode) {
+        compatibilityMode = mode
+        UserDefaults.standard.set(mode.rawValue, forKey: compatibilityModeKey)
+    }
+
+    func saveUltraQualityAudio(_ enabled: Bool) {
+        transcodeManager.ultraQualityAudio = enabled
+        UserDefaults.standard.set(enabled, forKey: ultraQualityKey)
     }
 
     // MARK: - Setup
@@ -95,18 +196,66 @@ class AppState: ObservableObject {
             Task { @MainActor in
                 self?.playbackProgress = progress
                 self?.duration = duration
+                self?.checkForCacheCleanup(progress: progress, duration: duration)
             }
         }
+
+        // Bind transcoder state to app state
+        transcodeManager.$isConverting
+            .receive(on: DispatchQueue.main)
+            .assign(to: &$isConverting)
+
+        transcodeManager.$progress
+            .receive(on: DispatchQueue.main)
+            .assign(to: &$conversionProgress)
+
+        transcodeManager.$statusMessage
+            .receive(on: DispatchQueue.main)
+            .assign(to: &$conversionStatus)
     }
 
     // MARK: - Actions
 
     func loadMedia(from url: URL) {
+        appStateLogger.info("🎬 Loading media: \(url.lastPathComponent)")
         selectedMediaURL = url
-        mediaPlayer.loadMedia(from: url)
+        conversionError = nil
+
+        // Stop any existing HTTP server from previous conversion
+        transcodeManager.stopServer()
+
+        // Reset cleanup tracking for new media
+        currentConvertedURL = nil
+        hasCleanedUpCurrentFile = false
+
+        // Always use TranscodeManager for smart format detection
+        // It will return the original URL for compatible files (Path 0: direct playback)
+        // or convert as needed (Path 1-3: remux, audio transcode, full transcode)
+        Task {
+            do {
+                let playableURL = try await transcodeManager.convertForAirPlay(from: url, mode: compatibilityMode)
+
+                // Track if this is a converted file (not the original) for cache cleanup
+                if playableURL != url {
+                    currentConvertedURL = playableURL
+                    appStateLogger.info("✅ Ready to play: \(playableURL.lastPathComponent)")
+                }
+
+                mediaPlayer.loadMedia(from: playableURL)
+            } catch {
+                appStateLogger.error("❌ Failed to prepare media: \(error.localizedDescription)")
+                conversionError = error.localizedDescription
+            }
+        }
+    }
+
+    /// Cancel any ongoing conversion
+    func cancelConversion() {
+        transcodeManager.cancel()
     }
 
     func togglePlayback() {
+        appStateLogger.info("⏯️ Toggle playback - currently playing: \(self.isPlaying)")
         if isPlaying {
             mediaPlayer.pause()
         } else {
@@ -115,11 +264,61 @@ class AppState: ObservableObject {
     }
 
     func seek(to progress: Double) {
+        appStateLogger.info("⏭️ Seeking to: \(progress)")
         mediaPlayer.seek(to: progress)
     }
 
     func setVolume(_ volume: Float) {
+        appStateLogger.info("🔊 Setting volume: \(volume)")
         self.volume = volume
         mediaPlayer.setVolume(volume)
+    }
+
+    // MARK: - Cache Cleanup
+
+    /// Check if playback has passed the cleanup threshold and clean up the converted file
+    private func checkForCacheCleanup(progress: Double, duration: Double) {
+        // Only cleanup converted files, not native files
+        guard let convertedURL = currentConvertedURL,
+              !hasCleanedUpCurrentFile,
+              duration > 0 else { return }
+
+        let watchedPercentage = progress / duration
+
+        if watchedPercentage >= cleanupThreshold {
+            appStateLogger.info("🗑️ Playback reached \(Int(watchedPercentage * 100))%, scheduling cache cleanup for: \(convertedURL.lastPathComponent)")
+            hasCleanedUpCurrentFile = true
+
+            // Schedule cleanup after a short delay to ensure playback continues smoothly
+            Task {
+                // Wait a bit before deleting to avoid any file access issues
+                try? await Task.sleep(nanoseconds: 5_000_000_000) // 5 seconds
+
+                // Check if this is an HLS playlist or regular file
+                if convertedURL.pathExtension == "m3u8" {
+                    // HLS stream - stop HTTP server first, then remove the directory
+                    self.transcodeManager.stopServer()
+                    CacheManager.removeHLSCache(playlistURL: convertedURL)
+                    appStateLogger.info("🗑️ Successfully deleted HLS cache")
+                } else {
+                    // Regular MP4 file
+                    do {
+                        try FileManager.default.removeItem(at: convertedURL)
+                        appStateLogger.info("🗑️ Successfully deleted converted file: \(convertedURL.lastPathComponent)")
+                    } catch {
+                        appStateLogger.error("❌ Failed to delete converted file: \(error.localizedDescription)")
+                    }
+                }
+            }
+        }
+    }
+
+    /// Clean up cache files older than the expiration period (called on app launch)
+    private func cleanupOldCacheFiles() {
+        appStateLogger.info("🧹 Checking for old cache files (older than \(self.cacheExpirationDays) days)...")
+        CacheManager.clearOldCache(olderThan: self.cacheExpirationDays)
+
+        let cacheSize = CacheManager.formattedCacheSize()
+        appStateLogger.info("📦 Current cache size: \(cacheSize)")
     }
 }

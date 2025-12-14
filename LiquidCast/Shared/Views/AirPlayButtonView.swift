@@ -60,7 +60,7 @@ struct AirPlayRoutePickerRepresentable: NSViewRepresentable {
         let picker = AVRoutePickerView()
         picker.isRoutePickerButtonBordered = false
         picker.setRoutePickerButtonColor(.white, for: .normal)
-        picker.setRoutePickerButtonColor(.white.withAlphaComponent(0.6), for: .highlighted)
+        picker.setRoutePickerButtonColor(.white.withAlphaComponent(0.6), for: .activeHighlighted)
         return picker
     }
 

@@ -306,16 +306,26 @@ struct WindowThumbnail: View {
     }
 
     private func loadThumbnail() async {
-        // Get window thumbnail using CGWindowListCreateImage
-        guard let cgImage = CGWindowListCreateImage(
-            .null,
-            .optionIncludingWindow,
-            CGWindowID(window.windowID),
-            [.boundsIgnoreFraming, .bestResolution]
-        ) else { return }
+        do {
+            // Create a filter for just this window
+            let filter = SCContentFilter(desktopIndependentWindow: window)
 
-        let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
-        thumbnail = nsImage
+            // Configure the screenshot
+            let config = SCStreamConfiguration()
+            config.width = 400  // Thumbnail size
+            config.height = 250
+            config.scalesToFit = true
+
+            // Capture the screenshot using ScreenCaptureKit
+            let image = try await SCScreenshotManager.captureImage(
+                contentFilter: filter,
+                configuration: config
+            )
+
+            thumbnail = NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height))
+        } catch {
+            // Silently fail - will show app icon as fallback
+        }
     }
 }
 
@@ -366,8 +376,7 @@ struct DisplayThumbnail: View {
 
 extension SCRunningApplication {
     var icon: NSImage? {
-        guard let bundleIdentifier = bundleIdentifier,
-              let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleIdentifier) else {
+        guard let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleIdentifier) else {
             return nil
         }
         return NSWorkspace.shared.icon(forFile: appURL.path)

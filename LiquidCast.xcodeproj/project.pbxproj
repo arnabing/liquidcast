@@ -7,7 +7,8 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		/* Shared Files */
+		06625E162EDE6ECB006DC699 /* LocalHTTPServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 06625E152EDE6ECB006DC699 /* LocalHTTPServer.swift */; };
+		06625E172EDE6ECB006DC699 /* LocalHTTPServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 06625E152EDE6ECB006DC699 /* LocalHTTPServer.swift */; };
 		A1000001001 /* LiquidCastApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000001000 /* LiquidCastApp.swift */; };
 		A1000002001 /* AppState.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000002000 /* AppState.swift */; };
 		A1000003001 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000003000 /* ContentView.swift */; };
@@ -17,8 +18,10 @@
 		A1000007001 /* MediaPlayerController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000007000 /* MediaPlayerController.swift */; };
 		A1000008001 /* AirPlayManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000008000 /* AirPlayManager.swift */; };
 		A1000009001 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A1000009000 /* Assets.xcassets */; };
-
-		/* macOS Files */
+		A1000010001 /* FormatDetector.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000010000 /* FormatDetector.swift */; };
+		A1000011001 /* CacheManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000011000 /* CacheManager.swift */; };
+		A1000012001 /* TranscodeManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000012000 /* TranscodeManager.swift */; };
+		A1000013001 /* ConversionOverlayView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000013000 /* ConversionOverlayView.swift */; };
 		A1100001001 /* LiquidCastApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000001000 /* LiquidCastApp.swift */; };
 		A1100002001 /* AppState.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000002000 /* AppState.swift */; };
 		A1100003001 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000003000 /* ContentView.swift */; };
@@ -31,14 +34,22 @@
 		A1100010001 /* ScreenCaptureManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1100010000 /* ScreenCaptureManager.swift */; };
 		A1100011001 /* WindowPickerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1100011000 /* WindowPickerView.swift */; };
 		A1100012001 /* macOSContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1100012000 /* macOSContentView.swift */; };
-
-		/* iOS Files */
+		A1100013001 /* FormatDetector.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000010000 /* FormatDetector.swift */; };
+		A1100014001 /* CacheManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000011000 /* CacheManager.swift */; };
+		A1100015001 /* TranscodeManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000012000 /* TranscodeManager.swift */; };
+		A1100016001 /* ConversionOverlayView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000013000 /* ConversionOverlayView.swift */; };
 		A1200001001 /* DocumentPickerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1200001000 /* DocumentPickerView.swift */; };
 		A1200002001 /* iOSContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1200002000 /* iOSContentView.swift */; };
+		A1300001001 /* TranscodeManagerMacOS.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1300001000 /* TranscodeManagerMacOS.swift */; };
+		A1300002001 /* TranscodeManageriOS.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1300002000 /* TranscodeManageriOS.swift */; };
+		A1400001001 /* FFmpegProcess.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1400001000 /* FFmpegProcess.swift */; };
+		A1400002001 /* HLSSegmentMonitor.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1400002000 /* HLSSegmentMonitor.swift */; };
+		A1400003001 /* MediaAnalyzer.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1400003000 /* MediaAnalyzer.swift */; };
+		A1400004001 /* MediaAnalyzer.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1400003000 /* MediaAnalyzer.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
-		/* Shared Files */
+		06625E152EDE6ECB006DC699 /* LocalHTTPServer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalHTTPServer.swift; sourceTree = "<group>"; name = LocalHTTPServer.swift; };
 		A1000001000 /* LiquidCastApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiquidCastApp.swift; sourceTree = "<group>"; };
 		A1000002000 /* AppState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppState.swift; sourceTree = "<group>"; };
 		A1000003000 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
@@ -48,20 +59,23 @@
 		A1000007000 /* MediaPlayerController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaPlayerController.swift; sourceTree = "<group>"; };
 		A1000008000 /* AirPlayManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AirPlayManager.swift; sourceTree = "<group>"; };
 		A1000009000 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
-
-		/* macOS Files */
+		A1000010000 /* FormatDetector.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FormatDetector.swift; sourceTree = "<group>"; };
+		A1000011000 /* CacheManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CacheManager.swift; sourceTree = "<group>"; };
+		A1000012000 /* TranscodeManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TranscodeManager.swift; sourceTree = "<group>"; };
+		A1000013000 /* ConversionOverlayView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConversionOverlayView.swift; sourceTree = "<group>"; };
 		A1100010000 /* ScreenCaptureManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenCaptureManager.swift; sourceTree = "<group>"; };
 		A1100011000 /* WindowPickerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WindowPickerView.swift; sourceTree = "<group>"; };
 		A1100012000 /* macOSContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = macOSContentView.swift; sourceTree = "<group>"; };
 		A1100013000 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		A1100014000 /* LiquidCast.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = LiquidCast.entitlements; sourceTree = "<group>"; };
-
-		/* iOS Files */
 		A1200001000 /* DocumentPickerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DocumentPickerView.swift; sourceTree = "<group>"; };
 		A1200002000 /* iOSContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = iOSContentView.swift; sourceTree = "<group>"; };
 		A1200003000 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
-
-		/* Products */
+		A1300001000 /* TranscodeManagerMacOS.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TranscodeManagerMacOS.swift; sourceTree = "<group>"; };
+		A1300002000 /* TranscodeManageriOS.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TranscodeManageriOS.swift; sourceTree = "<group>"; };
+		A1400001000 /* FFmpegProcess.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FFmpegProcess.swift; sourceTree = "<group>"; };
+		A1400002000 /* HLSSegmentMonitor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HLSSegmentMonitor.swift; sourceTree = "<group>"; };
+		A1400003000 /* MediaAnalyzer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaAnalyzer.swift; sourceTree = "<group>"; };
 		A2000001000 /* LiquidCast.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = LiquidCast.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		A2000002000 /* LiquidCast.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = LiquidCast.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -111,8 +125,19 @@
 				A4000005000 /* Views */,
 				A4000010000 /* MediaPlayer */,
 				A4000011000 /* AirPlayManager */,
+				A4000015000 /* Utils */,
+				A4000016000 /* Transcoder */,
+				A4000019000 /* HTTPServer */,
 			);
 			path = Shared;
+			sourceTree = "<group>";
+		};
+		A4000019000 /* HTTPServer */ = {
+			isa = PBXGroup;
+			children = (
+				06625E152EDE6ECB006DC699 /* LocalHTTPServer.swift */,
+			);
+			path = HTTPServer;
 			sourceTree = "<group>";
 		};
 		A4000004000 /* Models */ = {
@@ -130,24 +155,9 @@
 				A1000004000 /* LiquidGlassCard.swift */,
 				A1000005000 /* ModeSwitcher.swift */,
 				A1000006000 /* AirPlayButtonView.swift */,
+				A1000013000 /* ConversionOverlayView.swift */,
 			);
 			path = Views;
-			sourceTree = "<group>";
-		};
-		A4000010000 /* MediaPlayer */ = {
-			isa = PBXGroup;
-			children = (
-				A1000007000 /* MediaPlayerController.swift */,
-			);
-			path = MediaPlayer;
-			sourceTree = "<group>";
-		};
-		A4000011000 /* AirPlayManager */ = {
-			isa = PBXGroup;
-			children = (
-				A1000008000 /* AirPlayManager.swift */,
-			);
-			path = AirPlayManager;
 			sourceTree = "<group>";
 		};
 		A4000006000 /* macOS */ = {
@@ -158,24 +168,9 @@
 				A1100014000 /* LiquidCast.entitlements */,
 				A4000012000 /* ScreenCapture */,
 				A4000013000 /* WindowPicker */,
+				A4000017000 /* Transcoder */,
 			);
 			path = macOS;
-			sourceTree = "<group>";
-		};
-		A4000012000 /* ScreenCapture */ = {
-			isa = PBXGroup;
-			children = (
-				A1100010000 /* ScreenCaptureManager.swift */,
-			);
-			path = ScreenCapture;
-			sourceTree = "<group>";
-		};
-		A4000013000 /* WindowPicker */ = {
-			isa = PBXGroup;
-			children = (
-				A1100011000 /* WindowPickerView.swift */,
-			);
-			path = WindowPicker;
 			sourceTree = "<group>";
 		};
 		A4000007000 /* iOS */ = {
@@ -184,16 +179,9 @@
 				A1200002000 /* iOSContentView.swift */,
 				A1200003000 /* Info.plist */,
 				A4000014000 /* DocumentPicker */,
+				A4000018000 /* Transcoder */,
 			);
 			path = iOS;
-			sourceTree = "<group>";
-		};
-		A4000014000 /* DocumentPicker */ = {
-			isa = PBXGroup;
-			children = (
-				A1200001000 /* DocumentPickerView.swift */,
-			);
-			path = DocumentPicker;
 			sourceTree = "<group>";
 		};
 		A4000008000 /* Resources */ = {
@@ -213,6 +201,82 @@
 			name = Products;
 			sourceTree = "<group>";
 		};
+		A4000010000 /* MediaPlayer */ = {
+			isa = PBXGroup;
+			children = (
+				A1000007000 /* MediaPlayerController.swift */,
+			);
+			path = MediaPlayer;
+			sourceTree = "<group>";
+		};
+		A4000011000 /* AirPlayManager */ = {
+			isa = PBXGroup;
+			children = (
+				A1000008000 /* AirPlayManager.swift */,
+			);
+			path = AirPlayManager;
+			sourceTree = "<group>";
+		};
+		A4000012000 /* ScreenCapture */ = {
+			isa = PBXGroup;
+			children = (
+				A1100010000 /* ScreenCaptureManager.swift */,
+			);
+			path = ScreenCapture;
+			sourceTree = "<group>";
+		};
+		A4000013000 /* WindowPicker */ = {
+			isa = PBXGroup;
+			children = (
+				A1100011000 /* WindowPickerView.swift */,
+			);
+			path = WindowPicker;
+			sourceTree = "<group>";
+		};
+		A4000014000 /* DocumentPicker */ = {
+			isa = PBXGroup;
+			children = (
+				A1200001000 /* DocumentPickerView.swift */,
+			);
+			path = DocumentPicker;
+			sourceTree = "<group>";
+		};
+		A4000015000 /* Utils */ = {
+			isa = PBXGroup;
+			children = (
+				A1000010000 /* FormatDetector.swift */,
+				A1000011000 /* CacheManager.swift */,
+				A1400003000 /* MediaAnalyzer.swift */,
+			);
+			path = Utils;
+			sourceTree = "<group>";
+		};
+		A4000016000 /* Transcoder */ = {
+			isa = PBXGroup;
+			children = (
+				A1000012000 /* TranscodeManager.swift */,
+			);
+			path = Transcoder;
+			sourceTree = "<group>";
+		};
+		A4000017000 /* Transcoder */ = {
+			isa = PBXGroup;
+			children = (
+				A1300001000 /* TranscodeManagerMacOS.swift */,
+				A1400001000 /* FFmpegProcess.swift */,
+				A1400002000 /* HLSSegmentMonitor.swift */,
+			);
+			path = Transcoder;
+			sourceTree = "<group>";
+		};
+		A4000018000 /* Transcoder */ = {
+			isa = PBXGroup;
+			children = (
+				A1300002000 /* TranscodeManageriOS.swift */,
+			);
+			path = Transcoder;
+			sourceTree = "<group>";
+		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
@@ -227,6 +291,7 @@
 			buildRules = (
 			);
 			dependencies = (
+				06625E122EDE6C5A006DC699 /* PBXTargetDependency */,
 			);
 			name = "LiquidCast (iOS)";
 			productName = LiquidCast;
@@ -244,6 +309,7 @@
 			buildRules = (
 			);
 			dependencies = (
+				06625E142EDE6C62006DC699 /* PBXTargetDependency */,
 			);
 			name = "LiquidCast (macOS)";
 			productName = LiquidCast;
@@ -277,6 +343,9 @@
 				Base,
 			);
 			mainGroup = A4000001000;
+			packageReferences = (
+				06625E102EDE6C31006DC699 /* XCRemoteSwiftPackageReference "GCDWebServer" */,
+			);
 			productRefGroup = A4000009000 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
@@ -313,14 +382,21 @@
 			files = (
 				A1000001001 /* LiquidCastApp.swift in Sources */,
 				A1000002001 /* AppState.swift in Sources */,
+				06625E162EDE6ECB006DC699 /* LocalHTTPServer.swift in Sources */,
 				A1000003001 /* ContentView.swift in Sources */,
 				A1000004001 /* LiquidGlassCard.swift in Sources */,
 				A1000005001 /* ModeSwitcher.swift in Sources */,
 				A1000006001 /* AirPlayButtonView.swift in Sources */,
 				A1000007001 /* MediaPlayerController.swift in Sources */,
 				A1000008001 /* AirPlayManager.swift in Sources */,
+				A1000010001 /* FormatDetector.swift in Sources */,
+				A1000011001 /* CacheManager.swift in Sources */,
+				A1000012001 /* TranscodeManager.swift in Sources */,
+				A1000013001 /* ConversionOverlayView.swift in Sources */,
 				A1200001001 /* DocumentPickerView.swift in Sources */,
 				A1200002001 /* iOSContentView.swift in Sources */,
+				A1300002001 /* TranscodeManageriOS.swift in Sources */,
+				A1400004001 /* MediaAnalyzer.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -337,12 +413,32 @@
 				A1100007001 /* MediaPlayerController.swift in Sources */,
 				A1100008001 /* AirPlayManager.swift in Sources */,
 				A1100010001 /* ScreenCaptureManager.swift in Sources */,
+				06625E172EDE6ECB006DC699 /* LocalHTTPServer.swift in Sources */,
 				A1100011001 /* WindowPickerView.swift in Sources */,
 				A1100012001 /* macOSContentView.swift in Sources */,
+				A1100013001 /* FormatDetector.swift in Sources */,
+				A1100014001 /* CacheManager.swift in Sources */,
+				A1100015001 /* TranscodeManager.swift in Sources */,
+				A1100016001 /* ConversionOverlayView.swift in Sources */,
+				A1300001001 /* TranscodeManagerMacOS.swift in Sources */,
+				A1400001001 /* FFmpegProcess.swift in Sources */,
+				A1400002001 /* HLSSegmentMonitor.swift in Sources */,
+				A1400003001 /* MediaAnalyzer.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		06625E122EDE6C5A006DC699 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			productRef = 06625E112EDE6C5A006DC699 /* GCDWebServer */;
+		};
+		06625E142EDE6C62006DC699 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			productRef = 06625E132EDE6C62006DC699 /* GCDWebServer */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		A8000001000 /* Debug */ = {
@@ -466,7 +562,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = B5NKL8WLDP;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = LiquidCast/iOS/Info.plist;
@@ -475,7 +571,7 @@
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
-				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -497,7 +593,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = B5NKL8WLDP;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = LiquidCast/iOS/Info.plist;
@@ -506,7 +602,7 @@
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
-				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -541,7 +637,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.liquidcast.app.macos;
 				PRODUCT_NAME = LiquidCast;
@@ -570,7 +666,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.liquidcast.app.macos;
 				PRODUCT_NAME = LiquidCast;
@@ -611,6 +707,30 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		06625E102EDE6C31006DC699 /* XCRemoteSwiftPackageReference "GCDWebServer" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/yene/GCDWebServer";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 3.5.7;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		06625E112EDE6C5A006DC699 /* GCDWebServer */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 06625E102EDE6C31006DC699 /* XCRemoteSwiftPackageReference "GCDWebServer" */;
+			productName = GCDWebServer;
+		};
+		06625E132EDE6C62006DC699 /* GCDWebServer */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 06625E102EDE6C31006DC699 /* XCRemoteSwiftPackageReference "GCDWebServer" */;
+			productName = GCDWebServer;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = A7000001000 /* Project object */;
 }

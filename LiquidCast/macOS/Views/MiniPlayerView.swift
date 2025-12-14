@@ -4,7 +4,7 @@ import UniformTypeIdentifiers
 /// Compact Winamp-style mini player
 struct MiniPlayerView: View {
     @EnvironmentObject var appState: AppState
-    @State private var isHovering = false
+    @State private var isDropTargeted = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -34,13 +34,20 @@ struct MiniPlayerView: View {
                     startPoint: .topLeading,
                     endPoint: .bottomTrailing
                 )
+                // Drop highlight
+                if isDropTargeted {
+                    Color.blue.opacity(0.3)
+                }
             }
         )
         .clipShape(RoundedRectangle(cornerRadius: 12))
         .overlay(
             RoundedRectangle(cornerRadius: 12)
-                .stroke(Color.white.opacity(0.1), lineWidth: 1)
+                .stroke(isDropTargeted ? Color.blue : Color.white.opacity(0.1), lineWidth: isDropTargeted ? 2 : 1)
         )
+        .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
+            handleDrop(providers: providers)
+        }
         .fileImporter(
             isPresented: $appState.showingFilePicker,
             allowedContentTypes: [
@@ -56,6 +63,29 @@ struct MiniPlayerView: View {
                 }
             }
         }
+    }
+
+    /// Handle dropped files
+    private func handleDrop(providers: [NSItemProvider]) -> Bool {
+        guard let provider = providers.first else { return false }
+
+        provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, error in
+            guard let data = item as? Data,
+                  let url = URL(dataRepresentation: data, relativeTo: nil) else {
+                return
+            }
+
+            // Check if it's a video file
+            let videoExtensions = ["mp4", "mov", "m4v", "mkv", "avi", "webm", "wmv", "flv"]
+            guard videoExtensions.contains(url.pathExtension.lowercased()) else { return }
+
+            DispatchQueue.main.async {
+                _ = url.startAccessingSecurityScopedResource()
+                appState.loadMedia(from: url)
+            }
+        }
+
+        return true
     }
 }
 

@@ -100,6 +100,42 @@ struct MenuBarContentView: View {
 
         Divider()
 
+        // Settings submenu
+        Menu("Settings") {
+            // Ultra Quality toggle
+            Toggle("Ultra Quality", isOn: Binding(
+                get: { appState.transcodeManager.ultraQualityAudio },
+                set: { appState.saveUltraQualityAudio($0) }
+            ))
+
+            Divider()
+
+            // Target device
+            Menu("Target Device") {
+                ForEach(CompatibilityMode.allCases, id: \.self) { mode in
+                    Button {
+                        appState.saveCompatibilityMode(mode)
+                    } label: {
+                        HStack {
+                            Text(mode.rawValue)
+                            if appState.compatibilityMode == mode {
+                                Image(systemName: "checkmark")
+                            }
+                        }
+                    }
+                }
+            }
+
+            Divider()
+
+            // Cache management
+            Button("Clear Cache (\(CacheManager.formattedCacheSize()))") {
+                CacheManager.clearAllCache()
+            }
+        }
+
+        Divider()
+
         Button("Quit LiquidCast") {
             NSApplication.shared.terminate(nil)
         }

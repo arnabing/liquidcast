@@ -1,86 +1,88 @@
 # LiquidCast
 
-A native macOS + iOS app for high-quality media casting to Apple TV.
+A compact macOS app for casting **any video format** to Apple TV via AirPlay.
+
+![Mini Player](docs/mini-player.png)
 
 ## Features
 
-### Two Quality Modes
+- **Play any video format** - MKV, AVI, MP4, MOV, WebM, etc.
+- **Smart transcoding** - Automatically converts incompatible formats via FFmpeg
+- **Compact mini player** - Winamp-style 320x120 window
+- **Menu bar integration** - Control playback from the menu bar
+- **Ultra Quality mode** - 320kbps 5.1 surround audio + higher video bitrates
 
-1. **Highest Quality** - Direct streaming via AVPlayer with `allowsExternalPlayback = true`
-   - No re-encoding, best quality
-   - Perfect for local video files
+## How It Works
 
-2. **High Quality** (macOS only) - ScreenCaptureKit + VideoToolbox H.265 encoding
-   - Capture any window or app
-   - 50 Mbps H.265 encoding at 60fps
+LiquidCast uses FFmpeg to convert videos for AirPlay compatibility:
 
-### Liquid Glass UI
-- Beautiful frosted glass UI using SwiftUI's `.ultraThinMaterial`
-- Subtle gradients and animations
-- Dark mode optimized
+| Your File | What Happens | Speed |
+|-----------|--------------|-------|
+| MP4 (H.264 + AAC) | Direct playback | Instant |
+| MKV (H.264 + AAC) | Quick remux to MP4 | ~2 seconds |
+| MKV (H.264 + DTS/AC3) | Audio transcode, video copy | Fast |
+| AVI (XviD/etc) | Full transcode via HLS | Starts in ~5s |
+
+For files needing transcode, playback starts immediately via HLS streaming while conversion continues in background.
 
 ## Requirements
 
-- **macOS**: 13.0+ (Ventura)
-- **iOS**: 16.0+
-- **Xcode**: 15.0+
+- **macOS 13.0+** (Ventura or later)
+- **FFmpeg** - Install with Homebrew:
+  ```bash
+  brew install ffmpeg
+  ```
+
+## Installation
+
+1. Clone or download this repo
+2. Open `LiquidCast.xcodeproj` in Xcode 15+
+3. Build and run (Cmd+R)
+
+## Usage
+
+1. **Connect to AirPlay** - Click the AirPlay icon and select your Apple TV
+2. **Open a video** - Click + or drag a file onto the mini player
+3. **Control playback** - Use the mini player or menu bar
+
+### Keyboard Shortcuts
+
+| Key | Action |
+|-----|--------|
+| Space | Play/Pause |
+| ← | Skip back 10s |
+| → | Skip forward 30s |
+| ⌘O | Open file |
+| ⌘Q | Quit |
+
+## Settings (Menu Bar)
+
+- **Ultra Quality** - Higher bitrates + 5.1 surround audio
+- **Target Device** - Apple TV (best quality) or Smart TV (wider compatibility)
+- **Clear Cache** - Remove converted files
 
 ## Project Structure
 
 ```
 LiquidCast/
-├── Shared/                    # Cross-platform code (95%)
-│   ├── Views/                 # SwiftUI views
-│   │   ├── ContentView.swift
-│   │   ├── LiquidGlassCard.swift
-│   │   ├── ModeSwitcher.swift
-│   │   └── AirPlayButtonView.swift
-│   ├── MediaPlayer/          # AVPlayer wrapper
-│   │   └── MediaPlayerController.swift
-│   ├── AirPlayManager/       # AirPlay device management
-│   │   └── AirPlayManager.swift
-│   └── Models/
-│       └── AppState.swift
+├── Shared/
+│   ├── LiquidCastApp.swift      # App entry + menu bar
+│   ├── Models/AppState.swift    # Central state
+│   ├── Transcoder/              # FFmpeg integration
+│   ├── HTTPServer/              # HLS streaming server
+│   └── Utils/                   # MediaAnalyzer, CacheManager
 ├── macOS/
-│   ├── ScreenCapture/        # ScreenCaptureKit integration
-│   │   └── ScreenCaptureManager.swift
-│   └── WindowPicker/         # Google Meet-style window picker
-│       └── WindowPickerView.swift
-├── iOS/
-│   └── DocumentPicker/       # Files app integration
-│       └── DocumentPickerView.swift
-└── Resources/
-    └── Assets.xcassets/
+│   ├── Views/MiniPlayerView.swift
+│   └── Transcoder/              # FFmpeg process management
+└── iOS/                         # iOS support (limited)
 ```
 
-## Building
+## Technical Details
 
-1. Open `LiquidCast.xcodeproj` in Xcode 15+
-2. Select target:
-   - `LiquidCast (macOS)` for Mac
-   - `LiquidCast (iOS)` for iPhone/iPad
-3. Build and run (Cmd+R)
-
-### macOS Screen Recording Permission
-
-For window capture mode, grant Screen Recording permission:
-System Preferences → Privacy & Security → Screen Recording → Enable LiquidCast
-
-## Key Technologies
-
-- **AVFoundation** - Media playback with AirPlay
-- **AVRoutePickerView** - System AirPlay device picker
-- **ScreenCaptureKit** - Window/screen capture (macOS)
-- **VideoToolbox** - Hardware H.265 encoding
-
-## Video Encoding Settings
-
-```swift
-// H.265 settings for maximum quality
-kVTCompressionPropertyKey_ProfileLevel: kVTProfileLevel_HEVC_Main10_AutoLevel
-kVTCompressionPropertyKey_AverageBitRate: 50_000_000  // 50 Mbps
-kVTCompressionPropertyKey_Quality: 1.0
-```
+- **HLS Streaming** - Converts to HTTP Live Streaming for immediate playback
+- **Hardware Encoding** - Uses VideoToolbox H.264 encoder
+- **Local HTTP Server** - Serves HLS segments to AirPlay (port 8765-8775)
+- **No external dependencies** - Uses only Apple frameworks + FFmpeg
 
 ## License
 

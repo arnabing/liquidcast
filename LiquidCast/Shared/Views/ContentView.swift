@@ -2,6 +2,8 @@ import SwiftUI
 import AVKit
 import UniformTypeIdentifiers
 
+/// Full-size content view used by iOS.
+/// macOS uses MiniPlayerView instead (compact Winamp-style player).
 struct ContentView: View {
     @EnvironmentObject var appState: AppState
     @State private var showingSettings = false

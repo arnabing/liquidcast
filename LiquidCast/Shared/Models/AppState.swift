@@ -94,6 +94,7 @@ class AppState: ObservableObject {
     // MARK: - Conversion State
 
     @Published var isConverting: Bool = false
+    @Published var isStreaming: Bool = false
     @Published var conversionProgress: Double = 0.0
     @Published var conversionStatus: String = ""
     @Published var conversionError: String?
@@ -104,14 +105,8 @@ class AppState: ObservableObject {
     let airPlayManager = AirPlayManager()
     let transcodeManager = TranscodeManager()
 
-    // MARK: - Cache Cleanup Tracking
+    // MARK: - Cache Settings
 
-    /// The converted file URL for the currently playing media (if any)
-    private var currentConvertedURL: URL?
-    /// Whether we've already cleaned up the current converted file
-    private var hasCleanedUpCurrentFile: Bool = false
-    /// Threshold for considering media "mostly watched" (80% = credits)
-    private let cleanupThreshold: Double = 0.80
     /// Days after which cached files are automatically deleted
     private let cacheExpirationDays: Int = 7
 
@@ -196,7 +191,6 @@ class AppState: ObservableObject {
             Task { @MainActor in
                 self?.playbackProgress = progress
                 self?.duration = duration
-                self?.checkForCacheCleanup(progress: progress, duration: duration)
             }
         }
 
@@ -204,6 +198,10 @@ class AppState: ObservableObject {
         transcodeManager.$isConverting
             .receive(on: DispatchQueue.main)
             .assign(to: &$isConverting)
+
+        transcodeManager.$isStreaming
+            .receive(on: DispatchQueue.main)
+            .assign(to: &$isStreaming)
 
         transcodeManager.$progress
             .receive(on: DispatchQueue.main)
@@ -224,10 +222,6 @@ class AppState: ObservableObject {
         // Stop any existing HTTP server from previous conversion
         transcodeManager.stopServer()
 
-        // Reset cleanup tracking for new media
-        currentConvertedURL = nil
-        hasCleanedUpCurrentFile = false
-
         // Always use TranscodeManager for smart format detection
         // It will return the original URL for compatible files (Path 0: direct playback)
         // or convert as needed (Path 1-3: remux, audio transcode, full transcode)
@@ -235,9 +229,7 @@ class AppState: ObservableObject {
             do {
                 let playableURL = try await transcodeManager.convertForAirPlay(from: url, mode: compatibilityMode)
 
-                // Track if this is a converted file (not the original) for cache cleanup
                 if playableURL != url {
-                    currentConvertedURL = playableURL
                     appStateLogger.info("✅ Ready to play: \(playableURL.lastPathComponent)")
                 }
 
@@ -275,43 +267,6 @@ class AppState: ObservableObject {
     }
 
     // MARK: - Cache Cleanup
-
-    /// Check if playback has passed the cleanup threshold and clean up the converted file
-    private func checkForCacheCleanup(progress: Double, duration: Double) {
-        // Only cleanup converted files, not native files
-        guard let convertedURL = currentConvertedURL,
-              !hasCleanedUpCurrentFile,
-              duration > 0 else { return }
-
-        let watchedPercentage = progress / duration
-
-        if watchedPercentage >= cleanupThreshold {
-            appStateLogger.info("🗑️ Playback reached \(Int(watchedPercentage * 100))%, scheduling cache cleanup for: \(convertedURL.lastPathComponent)")
-            hasCleanedUpCurrentFile = true
-
-            // Schedule cleanup after a short delay to ensure playback continues smoothly
-            Task {
-                // Wait a bit before deleting to avoid any file access issues
-                try? await Task.sleep(nanoseconds: 5_000_000_000) // 5 seconds
-
-                // Check if this is an HLS playlist or regular file
-                if convertedURL.pathExtension == "m3u8" {
-                    // HLS stream - stop HTTP server first, then remove the directory
-                    self.transcodeManager.stopServer()
-                    CacheManager.removeHLSCache(playlistURL: convertedURL)
-                    appStateLogger.info("🗑️ Successfully deleted HLS cache")
-                } else {
-                    // Regular MP4 file
-                    do {
-                        try FileManager.default.removeItem(at: convertedURL)
-                        appStateLogger.info("🗑️ Successfully deleted converted file: \(convertedURL.lastPathComponent)")
-                    } catch {
-                        appStateLogger.error("❌ Failed to delete converted file: \(error.localizedDescription)")
-                    }
-                }
-            }
-        }
-    }
 
     /// Clean up cache files older than the expiration period (called on app launch)
     private func cleanupOldCacheFiles() {

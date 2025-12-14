@@ -249,6 +249,7 @@ extension TranscodeManager {
 
             await MainActor.run {
                 statusMessage = "Streaming..."
+                isStreaming = true
             }
 
             // Monitor progress in background

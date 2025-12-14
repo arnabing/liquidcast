@@ -15,7 +15,7 @@ struct LiquidCastApp: App {
         }
         .windowStyle(.hiddenTitleBar)
         .windowResizability(.contentSize)
-        .defaultSize(width: 320, height: 120)
+        .defaultSize(width: 500, height: 220)
         .commands {
             CommandGroup(replacing: .newItem) {}
         }

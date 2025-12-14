@@ -34,6 +34,7 @@ class TranscodeManager: ObservableObject {
     // MARK: - Published Properties
 
     @Published var isConverting = false
+    @Published var isStreaming = false  // True when HLS server is actively streaming
     @Published var progress: Double = 0
     @Published var statusMessage: String = ""
     @Published var currentFileName: String = ""
@@ -92,6 +93,7 @@ class TranscodeManager: ObservableObject {
     func stopServer() {
         #if os(macOS)
         httpServer.stop()
+        isStreaming = false
         #endif
     }
 }

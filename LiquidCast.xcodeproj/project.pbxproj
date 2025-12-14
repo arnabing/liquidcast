@@ -46,6 +46,7 @@
 		A1400002001 /* HLSSegmentMonitor.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1400002000 /* HLSSegmentMonitor.swift */; };
 		A1400003001 /* MediaAnalyzer.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1400003000 /* MediaAnalyzer.swift */; };
 		A1400004001 /* MediaAnalyzer.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1400003000 /* MediaAnalyzer.swift */; };
+		A1500001001 /* MiniPlayerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1500001000 /* MiniPlayerView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -76,6 +77,7 @@
 		A1400001000 /* FFmpegProcess.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FFmpegProcess.swift; sourceTree = "<group>"; };
 		A1400002000 /* HLSSegmentMonitor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HLSSegmentMonitor.swift; sourceTree = "<group>"; };
 		A1400003000 /* MediaAnalyzer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaAnalyzer.swift; sourceTree = "<group>"; };
+		A1500001000 /* MiniPlayerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MiniPlayerView.swift; sourceTree = "<group>"; };
 		A2000001000 /* LiquidCast.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = LiquidCast.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		A2000002000 /* LiquidCast.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = LiquidCast.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -169,8 +171,17 @@
 				A4000012000 /* ScreenCapture */,
 				A4000013000 /* WindowPicker */,
 				A4000017000 /* Transcoder */,
+				A4000020000 /* Views */,
 			);
 			path = macOS;
+			sourceTree = "<group>";
+		};
+		A4000020000 /* Views */ = {
+			isa = PBXGroup;
+			children = (
+				A1500001000 /* MiniPlayerView.swift */,
+			);
+			path = Views;
 			sourceTree = "<group>";
 		};
 		A4000007000 /* iOS */ = {
@@ -420,6 +431,7 @@
 				A1100014001 /* CacheManager.swift in Sources */,
 				A1100015001 /* TranscodeManager.swift in Sources */,
 				A1100016001 /* ConversionOverlayView.swift in Sources */,
+				A1500001001 /* MiniPlayerView.swift in Sources */,
 				A1300001001 /* TranscodeManagerMacOS.swift in Sources */,
 				A1400001001 /* FFmpegProcess.swift in Sources */,
 				A1400002001 /* HLSSegmentMonitor.swift in Sources */,

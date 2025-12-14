@@ -273,7 +273,16 @@ class LocalHTTPServer {
         }
 
         do {
-            let fileData = try Data(contentsOf: fileURL)
+            var fileData: Data
+
+            // For playlist files, filter to only include existing segments
+            if path.hasSuffix(".m3u8") {
+                let filteredPlaylist = filterPlaylistToExistingSegments(playlistURL: fileURL, directory: directory)
+                fileData = Data(filteredPlaylist.utf8)
+            } else {
+                fileData = try Data(contentsOf: fileURL)
+            }
+
             let contentType = mimeType(for: fileURL.pathExtension)
 
             let headers = """
@@ -299,6 +308,88 @@ class LocalHTTPServer {
             logger.error("Error reading file \(path): \(error.localizedDescription)")
             sendErrorResponse(500, on: connection)
         }
+    }
+
+    /// Filter HLS playlist to only include segments that actually exist on disk
+    /// This is critical for live transcoding where FFmpeg writes the full playlist
+    /// but segments are created progressively
+    private func filterPlaylistToExistingSegments(playlistURL: URL, directory: URL) -> String {
+        guard let playlistContent = try? String(contentsOf: playlistURL, encoding: .utf8) else {
+            return ""
+        }
+
+        var filteredLines: [String] = []
+        let lines = playlistContent.components(separatedBy: "\n")
+        var skipNextSegment = false
+        var lastExistingSegmentIndex = -1
+        var segmentDurations: [(index: Int, extinf: String, segment: String)] = []
+
+        // First pass: collect all segments and check existence
+        var i = 0
+        while i < lines.count {
+            let line = lines[i].trimmingCharacters(in: .whitespaces)
+
+            if line.hasPrefix("#EXTINF:") {
+                // This line is followed by a segment filename
+                let nextIndex = i + 1
+                if nextIndex < lines.count {
+                    let segmentLine = lines[nextIndex].trimmingCharacters(in: .whitespaces)
+                    if !segmentLine.isEmpty && !segmentLine.hasPrefix("#") {
+                        let segmentURL = directory.appendingPathComponent(segmentLine)
+                        if FileManager.default.fileExists(atPath: segmentURL.path) {
+                            // Extract segment number for ordering
+                            if let range = segmentLine.range(of: #"segment(\d+)"#, options: .regularExpression),
+                               let num = Int(segmentLine[range].dropFirst(7)) {
+                                segmentDurations.append((index: num, extinf: line, segment: segmentLine))
+                                lastExistingSegmentIndex = max(lastExistingSegmentIndex, num)
+                            } else {
+                                segmentDurations.append((index: segmentDurations.count, extinf: line, segment: segmentLine))
+                            }
+                        }
+                    }
+                }
+                i += 2
+                continue
+            }
+            i += 1
+        }
+
+        // Sort segments by index (in case they were found out of order)
+        segmentDurations.sort { $0.index < $1.index }
+
+        // Build filtered playlist
+        // Copy header lines
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("#EXTM3U") ||
+               trimmed.hasPrefix("#EXT-X-VERSION") ||
+               trimmed.hasPrefix("#EXT-X-TARGETDURATION") ||
+               trimmed.hasPrefix("#EXT-X-MEDIA-SEQUENCE") ||
+               trimmed.hasPrefix("#EXT-X-PLAYLIST-TYPE") ||
+               trimmed.hasPrefix("#EXT-X-INDEPENDENT-SEGMENTS") {
+                filteredLines.append(line)
+            }
+        }
+
+        // Add only existing segments
+        for segment in segmentDurations {
+            filteredLines.append(segment.extinf)
+            filteredLines.append(segment.segment)
+        }
+
+        // Don't add #EXT-X-ENDLIST unless transcoding is complete
+        // (We can detect this by checking if FFmpeg is still running,
+        // but for now we check if the original playlist has it AND all segments exist)
+        let originalHasEndList = playlistContent.contains("#EXT-X-ENDLIST")
+        if originalHasEndList {
+            // Count segments in original playlist
+            let originalSegmentCount = lines.filter { $0.hasSuffix(".ts") }.count
+            if segmentDurations.count >= originalSegmentCount {
+                filteredLines.append("#EXT-X-ENDLIST")
+            }
+        }
+
+        return filteredLines.joined(separator: "\n")
     }
 
     private func sendErrorResponse(_ code: Int, on connection: NWConnection) {

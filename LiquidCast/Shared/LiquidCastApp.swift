@@ -13,9 +13,8 @@ struct LiquidCastApp: App {
             MiniPlayerView()
                 .environmentObject(appState)
         }
-        .windowStyle(.hiddenTitleBar)
         .windowResizability(.contentSize)
-        .defaultSize(width: 500, height: 220)
+        .defaultSize(width: 500, height: 180)
         .commands {
             CommandGroup(replacing: .newItem) {}
         }
@@ -46,6 +45,19 @@ struct LiquidCastApp: App {
 class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         return true
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // Center window on screen and configure for glass effect
+        DispatchQueue.main.async {
+            if let window = NSApplication.shared.windows.first {
+                window.center()
+
+                // Make window background transparent for glass effect
+                window.isOpaque = false
+                window.backgroundColor = .clear
+            }
+        }
     }
 }
 
@@ -104,7 +116,7 @@ struct MenuBarContentView: View {
         Menu("Settings") {
             // Ultra Quality toggle
             Toggle("Ultra Quality", isOn: Binding(
-                get: { appState.transcodeManager.ultraQualityAudio },
+                get: { appState.ultraQualityEnabled },
                 set: { appState.saveUltraQualityAudio($0) }
             ))
 

@@ -145,12 +145,16 @@ struct CacheManager {
         do {
             let contents = try FileManager.default.contentsOfDirectory(
                 at: cacheDirectory,
-                includingPropertiesForKeys: [.fileSizeKey]
+                includingPropertiesForKeys: [.fileSizeKey, .isDirectoryKey]
             )
 
             var totalSize: Int64 = 0
             for file in contents {
-                if let size = try file.resourceValues(forKeys: [.fileSizeKey]).fileSize {
+                let resourceValues = try? file.resourceValues(forKeys: [.fileSizeKey, .isDirectoryKey])
+                if resourceValues?.isDirectory == true {
+                    // For directories (HLS), calculate total size recursively
+                    totalSize += directorySize(at: file)
+                } else if let size = resourceValues?.fileSize {
                     totalSize += Int64(size)
                 }
             }
@@ -237,6 +241,33 @@ struct CacheManager {
         }
         return totalSize
     }
+
+    // MARK: - Playback Position
+
+    private static let positionPrefix = "playbackPosition_"
+
+    /// Save playback position for a file
+    static func savePlaybackPosition(for url: URL, position: Double) {
+        let key = positionPrefix + cacheKey(for: url)
+        UserDefaults.standard.set(position, forKey: key)
+    }
+
+    /// Get saved playback position for a file (returns nil if not found or < 10 seconds)
+    static func getPlaybackPosition(for url: URL) -> Double? {
+        let key = positionPrefix + cacheKey(for: url)
+        let position = UserDefaults.standard.double(forKey: key)
+        // Only return if meaningful (> 10 seconds in)
+        return position > 10 ? position : nil
+    }
+
+    /// Clear saved playback position
+    static func clearPlaybackPosition(for url: URL) {
+        let key = positionPrefix + cacheKey(for: url)
+        UserDefaults.standard.removeObject(forKey: key)
+        logger.info("🗑️ Cleared playback position for: \(url.lastPathComponent)")
+    }
+
+    // MARK: - Duplicate Cleanup
 
     /// Remove duplicate cache entries (files with same base name but different hashes)
     /// This cleans up files created by the old random hash bug

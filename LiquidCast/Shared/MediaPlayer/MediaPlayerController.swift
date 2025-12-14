@@ -174,6 +174,7 @@ class MediaPlayerController: NSObject, ObservableObject {
                     logger.info("✅ PlayerItem ready to play")
                     self?.isReady = true
                     self?.error = nil
+                    self?.play()  // Auto-play when ready
                 case .failed:
                     logger.error("❌ PlayerItem failed: \(playerItem.error?.localizedDescription ?? "unknown")")
                     self?.isReady = false

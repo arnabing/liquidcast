@@ -271,15 +271,18 @@ struct NowPlayingView: View {
 
     var body: some View {
         VStack(spacing: 32) {
+            // Ultra Quality toggle (floating capsule)
+            UltraQualityToggle()
+
             // Large media icon
-            LiquidGlassCard(cornerRadius: 32) {
+            LiquidGlassCard(content: {
                 Image(systemName: "film.fill")
                     .font(.system(size: 80, weight: .light))
                     .foregroundColor(.white.opacity(0.6))
                     .frame(width: 200, height: 200)
-            }
+            }, cornerRadius: 32)
 
-            // File name
+            // File name and streaming info
             if let url = appState.selectedMediaURL {
                 VStack(spacing: 8) {
                     Text(url.deletingPathExtension().lastPathComponent)
@@ -289,21 +292,77 @@ struct NowPlayingView: View {
                         .lineLimit(2)
                         .multilineTextAlignment(.center)
 
-                    Text(url.pathExtension.uppercased())
-                        .font(.caption)
-                        .fontWeight(.medium)
-                        .foregroundColor(.white.opacity(0.5))
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .background(
-                            Capsule()
-                                .fill(.white.opacity(0.1))
-                        )
+                    HStack(spacing: 8) {
+                        Text(url.pathExtension.uppercased())
+                            .font(.caption)
+                            .fontWeight(.medium)
+                            .foregroundColor(.white.opacity(0.5))
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(
+                                Capsule()
+                                    .fill(.white.opacity(0.1))
+                            )
+
+                        // Streaming info (resolution, codec)
+                        if !appState.streamingInfoText.isEmpty {
+                            Text(appState.streamingInfoText)
+                                .font(.caption)
+                                .foregroundColor(.white.opacity(0.6))
+                        }
+                    }
                 }
                 .padding(.horizontal, 40)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+// MARK: - Ultra Quality Toggle (Dolby Atmos style pill)
+
+struct UltraQualityToggle: View {
+    @EnvironmentObject var appState: AppState
+
+    private var isEnabled: Bool {
+        appState.transcodeManager.ultraQualityAudio
+    }
+
+    var body: some View {
+        Button(action: {
+            appState.saveUltraQualityAudio(!isEnabled)
+        }) {
+            HStack(spacing: 6) {
+                Image(systemName: "sparkles")
+                    .font(.system(size: 10, weight: .bold))
+                Text("Ultra Quality")
+                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+            }
+            .foregroundColor(isEnabled ? .black : .white.opacity(0.6))
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(
+                Capsule()
+                    .fill(isEnabled
+                        ? LinearGradient(
+                            colors: [Color.yellow, Color.orange],
+                            startPoint: .leading,
+                            endPoint: .trailing
+                          )
+                        : LinearGradient(
+                            colors: [Color.white.opacity(0.15), Color.white.opacity(0.1)],
+                            startPoint: .leading,
+                            endPoint: .trailing
+                          )
+                    )
+            )
+            .overlay(
+                Capsule()
+                    .stroke(isEnabled ? Color.orange.opacity(0.6) : Color.white.opacity(0.2), lineWidth: 1)
+            )
+            .shadow(color: isEnabled ? Color.orange.opacity(0.3) : .clear, radius: 8, x: 0, y: 2)
+        }
+        .buttonStyle(.plain)
     }
 }
 
@@ -313,7 +372,7 @@ struct PlaybackBarView: View {
     @EnvironmentObject var appState: AppState
 
     var body: some View {
-        LiquidGlassCard(cornerRadius: 20) {
+        LiquidGlassCard(content: {
             VStack(spacing: 12) {
                 // Progress bar
                 ProgressBarView()
@@ -350,7 +409,7 @@ struct PlaybackBarView: View {
             }
             .padding(.horizontal, 20)
             .padding(.vertical, 16)
-        }
+        }, cornerRadius: 20)
         .fileImporter(
             isPresented: $appState.showingFilePicker,
             allowedContentTypes: [
@@ -518,7 +577,7 @@ struct VolumeControl: View {
             Slider(value: $appState.volume, in: 0...1)
                 .tint(.white.opacity(0.6))
                 .frame(width: 60)
-                .onChange(of: appState.volume) { newValue in
+                .onChange(of: appState.volume) { _, newValue in
                     appState.setVolume(newValue)
                 }
         }
@@ -653,12 +712,13 @@ struct SettingsView: View {
                 }
                 #endif
 
-                Section("Quality") {
+                Section("Output Quality") {
                     Toggle("Ultra Quality", isOn: Binding(
                         get: { appState.transcodeManager.ultraQualityAudio },
                         set: { appState.saveUltraQualityAudio($0) }
                     ))
-                    Text("Higher video bitrates + 320kbps 5.1 surround audio. Disable for better device compatibility.")
+
+                    Text("**Ultra:** HEVC · 5.1 surround · High bitrate\nBest for Apple TV, Samsung, LG, Sony\n\n**Standard:** H.264 · Stereo · Compatible with all devices")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }

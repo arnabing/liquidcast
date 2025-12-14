@@ -19,7 +19,45 @@ class LocalHTTPServer {
 
     var baseURL: URL? {
         guard isRunning, assignedPort > 0 else { return nil }
-        return URL(string: "http://localhost:\(assignedPort)/")
+        // Use the actual local IP address instead of localhost
+        // AirPlay devices need to connect to our Mac's IP, not localhost
+        guard let ip = getLocalIPAddress() else {
+            return URL(string: "http://localhost:\(assignedPort)/")
+        }
+        return URL(string: "http://\(ip):\(assignedPort)/")
+    }
+
+    /// Get the local IP address that AirPlay devices can connect to
+    private func getLocalIPAddress() -> String? {
+        var address: String?
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+
+        guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else {
+            return nil
+        }
+
+        defer { freeifaddrs(ifaddr) }
+
+        for ptr in sequence(first: firstAddr, next: { $0.pointee.ifa_next }) {
+            let interface = ptr.pointee
+            let addrFamily = interface.ifa_addr.pointee.sa_family
+
+            // Check for IPv4 interface
+            if addrFamily == UInt8(AF_INET) {
+                let name = String(cString: interface.ifa_name)
+                // Prefer en0 (WiFi) or en1 (Ethernet)
+                if name == "en0" || name == "en1" {
+                    var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                    getnameinfo(interface.ifa_addr, socklen_t(interface.ifa_addr.pointee.sa_len),
+                               &hostname, socklen_t(hostname.count),
+                               nil, socklen_t(0), NI_NUMERICHOST)
+                    address = String(cString: hostname)
+                    break
+                }
+            }
+        }
+
+        return address
     }
 
     /// Start serving files from the specified directory
@@ -61,20 +99,25 @@ class LocalHTTPServer {
 
             // Use semaphore for synchronous wait (instead of Thread.sleep)
             let semaphore = DispatchSemaphore(value: 0)
-            var listenerReady = false
-            var listenerFailed = false
+
+            // Use thread-safe class wrapper for mutable state accessed in closure
+            final class ListenerState: @unchecked Sendable {
+                var ready = false
+                var failed = false
+            }
+            let state = ListenerState()
 
             // Capture sessionId value for use in closure (avoids MainActor isolation issue)
             let currentSessionId = sessionId
 
-            listener.stateUpdateHandler = { state in
-                switch state {
+            listener.stateUpdateHandler = { listenerState in
+                switch listenerState {
                 case .ready:
-                    listenerReady = true
+                    state.ready = true
                     semaphore.signal()
                 case .failed(let error):
                     logger.error("[\(currentSessionId ?? "?")] HTTP server failed on port \(port): \(error.localizedDescription)")
-                    listenerFailed = true
+                    state.failed = true
                     semaphore.signal()
                 case .cancelled:
                     semaphore.signal()
@@ -101,11 +144,14 @@ class LocalHTTPServer {
                 return nil
             }
 
-            if listenerReady && !listenerFailed {
+            if state.ready && !state.failed {
                 self.listener = listener
                 self.assignedPort = port
-                logger.info("[\(self.sessionId ?? "?")] HTTP server started on port \(port) serving: \(directory.lastPathComponent)")
-                return URL(string: "http://localhost:\(port)/")!
+                // Use actual IP address for AirPlay devices
+                let ip = getLocalIPAddress() ?? "localhost"
+                let url = URL(string: "http://\(ip):\(port)/")!
+                logger.info("[\(self.sessionId ?? "?")] HTTP server started on port \(port) at \(ip) serving: \(directory.lastPathComponent)")
+                return url
             }
 
             listener.cancel()

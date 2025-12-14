@@ -40,6 +40,12 @@ class TranscodeManager: ObservableObject {
     @Published var currentFileName: String = ""
     @Published var ultraQualityAudio = false  // 320kbps AAC with 5.1 surround
 
+    // Streaming info (populated after media analysis)
+    @Published var outputResolution: String = ""     // "1080p" or "4K"
+    @Published var outputVideoCodec: String = ""     // "H.264" or "HEVC"
+    @Published var outputAudioCodec: String = ""     // "AAC"
+    @Published var outputAudioChannels: String = ""  // "5.1" or "Stereo"
+
     // MARK: - Internal Properties (accessed by extensions)
 
     var isCancelled = false
@@ -51,15 +57,28 @@ class TranscodeManager: ObservableObject {
     let httpServer = LocalHTTPServer()
     #endif
 
+    // MARK: - Device Detection
+
+    /// Device name currently being converted for (used for HEVC detection)
+    var currentDeviceName: String?
+
+    /// Whether the current device supports HEVC (detected from device name)
+    var deviceSupportsHEVC: Bool {
+        guard let name = currentDeviceName else { return false }
+        return CompatibilityMode.detectWithHEVC(from: name).hevcSupported
+    }
+
     // MARK: - Public Methods
 
     /// Convert a media file to MP4 for AirPlay compatibility
     /// - Parameters:
     ///   - url: Source file URL
     ///   - mode: Compatibility mode for target device (Apple TV allows more formats than Smart TVs)
+    ///   - deviceName: Name of the AirPlay device (used for HEVC capability detection)
     /// - Returns: URL to the converted MP4 file
-    func convertForAirPlay(from url: URL, mode: CompatibilityMode = .appleTV) async throws -> URL {
-        logger.info("🔄 convertForAirPlay called for: \(url.lastPathComponent) (mode: \(mode.rawValue))")
+    func convertForAirPlay(from url: URL, mode: CompatibilityMode = .appleTV, deviceName: String? = nil) async throws -> URL {
+        currentDeviceName = deviceName
+        logger.info("🔄 convertForAirPlay called for: \(url.lastPathComponent) (mode: \(mode.rawValue), hevc: \(self.deviceSupportsHEVC))")
 
         // Call the platform-specific implementation
         // macOS: TranscodeManagerMacOS.swift provides the real implementation

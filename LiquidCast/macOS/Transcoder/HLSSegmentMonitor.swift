@@ -14,21 +14,23 @@ struct HLSSegmentMonitor {
         self.playlistURL = hlsDirectory.appendingPathComponent("playlist.m3u8")
     }
 
-    /// Wait for first HLS segment to be ready
-    /// Simple approach: poll filesystem until segment > 100KB exists
+    /// Wait for HLS segments to be ready for playback
+    /// Waits for at least 3 segments to ensure smooth playback start
     func waitForFirstSegment(timeout: TimeInterval) async throws -> URL {
-        logger.info("⏳ Waiting for first HLS segment (timeout: \(Int(timeout))s)")
+        logger.info("⏳ Waiting for HLS segments (timeout: \(Int(timeout))s)")
 
         let startTime = Date()
         var checkCount = 0
+        let minSegments = 3  // Wait for 3 segments (~18 seconds of video)
 
         while Date().timeIntervalSince(startTime) < timeout {
             checkCount += 1
 
-            // Check for ready segment
-            if let segment = findReadySegment() {
+            // Check for ready segments
+            let readyCount = countReadySegments()
+            if readyCount >= minSegments {
                 let elapsed = Int(Date().timeIntervalSince(startTime) * 1000)
-                logger.info("✅ Segment ready after \(elapsed)ms (check #\(checkCount)): \(segment.lastPathComponent)")
+                logger.info("✅ \(readyCount) segments ready after \(elapsed)ms (check #\(checkCount))")
                 return playlistURL
             }
 
@@ -42,20 +44,21 @@ struct HLSSegmentMonitor {
         throw HLSMonitorError.timeout(diagnostics: diag)
     }
 
-    /// Find a segment that's ready (exists and > 100KB)
-    private func findReadySegment() -> URL? {
+    /// Count segments that are ready (exist and > 100KB)
+    private func countReadySegments() -> Int {
         guard let files = try? FileManager.default.contentsOfDirectory(at: hlsDir, includingPropertiesForKeys: nil) else {
-            return nil
+            return 0
         }
 
+        var count = 0
         for file in files where file.pathExtension == "ts" {
             if let attrs = try? FileManager.default.attributesOfItem(atPath: file.path),
                let size = attrs[.size] as? Int64,
                size > 100_000 { // 100KB minimum
-                return file
+                count += 1
             }
         }
-        return nil
+        return count
     }
 
     private func gatherDiagnostics() -> String {

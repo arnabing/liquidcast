@@ -1,61 +1,36 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
+// Notification to trigger AirPlay picker programmatically
+extension Notification.Name {
+    static let triggerAirPlayPicker = Notification.Name("triggerAirPlayPicker")
+}
+
 /// Media player with glass UI
 struct MiniPlayerView: View {
     @EnvironmentObject var appState: AppState
     @State private var isDropTargeted = false
 
     var body: some View {
-        VStack(spacing: 0) {
-            // Glass title bar
-            TitleBarView()
+        VStack(spacing: 12) {
+            // Now playing info
+            NowPlayingBar()
 
-            // Main content
-            VStack(spacing: 12) {
-                // Now playing info
-                NowPlayingBar()
+            Spacer(minLength: 0)
 
-                // Status section (when converting/streaming)
-                if appState.isConverting || appState.isStreaming {
-                    StatusView()
-                }
+            // Progress bar
+            PlaybackProgressBar()
 
-                Spacer(minLength: 0)
-
-                // Progress bar
-                PlaybackProgressBar()
-
-                // Controls
-                ControlsBar()
-            }
-            .padding(.horizontal, 20)
-            .padding(.vertical, 16)
+            // Controls (centered)
+            ControlsBar()
         }
-        .frame(width: 500, height: 220)
-        .background(
-            ZStack {
-                // Glass material background
-                Color.clear
-                    .background(.ultraThinMaterial)
-
-                // Subtle gradient overlay for depth
-                LinearGradient(
-                    colors: [Color.purple.opacity(0.15), Color.blue.opacity(0.1)],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                )
-
-                // Drop highlight
-                if isDropTargeted {
-                    Color.blue.opacity(0.2)
-                }
-            }
-        )
-        .clipShape(RoundedRectangle(cornerRadius: 16))
+        .padding(.horizontal, 20)
+        .padding(.vertical, 16)
+        .frame(width: 500, height: 180)
+        .background(.ultraThinMaterial)
         .overlay(
-            RoundedRectangle(cornerRadius: 16)
-                .stroke(isDropTargeted ? Color.blue : Color.white.opacity(0.15), lineWidth: isDropTargeted ? 2 : 1)
+            RoundedRectangle(cornerRadius: 0)
+                .stroke(isDropTargeted ? Color.blue : Color.clear, lineWidth: isDropTargeted ? 2 : 0)
         )
         .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
             handleDrop(providers: providers)
@@ -79,6 +54,7 @@ struct MiniPlayerView: View {
 
     /// Handle dropped files
     private func handleDrop(providers: [NSItemProvider]) -> Bool {
+        guard appState.isConnectedToAirPlay else { return false }
         guard let provider = providers.first else { return false }
 
         provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, error in
@@ -101,22 +77,6 @@ struct MiniPlayerView: View {
     }
 }
 
-// MARK: - Glass Title Bar
-struct TitleBarView: View {
-    var body: some View {
-        HStack {
-            Text("LiquidCast")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundColor(.primary.opacity(0.7))
-
-            Spacer()
-        }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
-        .background(.ultraThinMaterial)
-    }
-}
-
 // MARK: - Now Playing Bar
 struct NowPlayingBar: View {
     @EnvironmentObject var appState: AppState
@@ -128,7 +88,7 @@ struct NowPlayingBar: View {
                 .fill(statusColor)
                 .frame(width: 8, height: 8)
 
-            // File name
+            // File name / status text
             VStack(alignment: .leading, spacing: 2) {
                 if let url = appState.selectedMediaURL {
                     Text(url.deletingPathExtension().lastPathComponent)
@@ -137,9 +97,44 @@ struct NowPlayingBar: View {
                         .lineLimit(1)
                         .truncationMode(.middle)
 
-                    Text(url.pathExtension.uppercased())
-                        .font(.system(size: 10, weight: .medium))
+                    // Format + streaming info + status
+                    HStack(spacing: 6) {
+                        Text(url.pathExtension.uppercased())
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundColor(.secondary)
+
+                        // Streaming info (resolution, codec)
+                        if !appState.streamingInfoText.isEmpty {
+                            Text("·")
+                                .foregroundColor(.secondary)
+                            Text(appState.streamingInfoText)
+                                .font(.system(size: 10))
+                                .foregroundColor(.secondary)
+                        }
+
+                        if appState.isConverting || appState.isStreaming {
+                            Text("·")
+                                .foregroundColor(.secondary)
+                            Text(appState.conversionStatus)
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundColor(appState.isConverting ? .orange : .cyan)
+                        }
+                    }
+                } else if !appState.airPlayManager.isAirPlayAvailable {
+                    Text("No AirPlay devices found")
+                        .font(.system(size: 14, weight: .medium))
                         .foregroundColor(.secondary)
+                } else if !appState.isConnectedToAirPlay {
+                    // Clickable text that triggers AirPlay picker
+                    Button(action: {
+                        // Post notification to trigger AirPlay picker click
+                        NotificationCenter.default.post(name: .triggerAirPlayPicker, object: nil)
+                    }) {
+                        Text("Select AirPlay device →")
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundColor(.blue)
+                    }
+                    .buttonStyle(.plain)
                 } else {
                     Text("Drop video file or click +")
                         .font(.system(size: 14, weight: .medium))
@@ -166,6 +161,12 @@ struct NowPlayingBar: View {
                 .clipShape(Capsule())
             }
         }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(.ultraThinMaterial)
+        )
     }
 
     private var statusColor: Color {
@@ -180,60 +181,6 @@ struct NowPlayingBar: View {
         } else {
             return .gray
         }
-    }
-}
-
-// MARK: - Status View (Converting/Streaming)
-struct StatusView: View {
-    @EnvironmentObject var appState: AppState
-
-    var body: some View {
-        HStack(spacing: 12) {
-            // Spinning indicator
-            ProgressView()
-                .scaleEffect(0.8)
-                .frame(width: 16, height: 16)
-
-            // Status message
-            VStack(alignment: .leading, spacing: 2) {
-                Text(statusTitle)
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundColor(statusColor)
-
-                if !appState.conversionStatus.isEmpty && appState.conversionStatus != statusTitle {
-                    Text(appState.conversionStatus)
-                        .font(.system(size: 11))
-                        .foregroundColor(.secondary)
-                }
-            }
-
-            Spacer()
-
-            // Progress percentage (if available)
-            if appState.conversionProgress > 0 && appState.conversionProgress < 1 {
-                Text("\(Int(appState.conversionProgress * 100))%")
-                    .font(.system(size: 12, weight: .medium, design: .monospaced))
-                    .foregroundColor(statusColor)
-            }
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background(statusColor.opacity(0.1))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
-    }
-
-    private var statusTitle: String {
-        if appState.isConverting {
-            return "Converting..."
-        } else if appState.isStreaming {
-            return "Streaming"
-        } else {
-            return ""
-        }
-    }
-
-    private var statusColor: Color {
-        appState.isConverting ? .orange : .cyan
     }
 }
 
@@ -304,37 +251,89 @@ struct ControlsBar: View {
     @EnvironmentObject var appState: AppState
 
     var body: some View {
-        HStack(spacing: 20) {
-            // Open file
-            ControlButton(icon: "plus.circle.fill", size: 20) {
-                appState.showingFilePicker = true
+        ZStack {
+            // Center: Playback controls (truly centered)
+            HStack(spacing: 20) {
+                // Skip back
+                ControlButton(icon: "gobackward.10", size: 18) {
+                    appState.seek(to: max(appState.playbackProgress - 10, 0))
+                }
+                .disabled(appState.selectedMediaURL == nil)
+
+                // Play/Pause (larger)
+                ControlButton(icon: appState.isPlaying ? "pause.circle.fill" : "play.circle.fill", size: 32) {
+                    appState.togglePlayback()
+                }
+                .disabled(appState.selectedMediaURL == nil)
+
+                // Skip forward
+                ControlButton(icon: "goforward.30", size: 18) {
+                    appState.seek(to: min(appState.playbackProgress + 30, appState.duration))
+                }
+                .disabled(appState.selectedMediaURL == nil)
             }
 
-            Spacer()
+            // Left side: File + Ultra Quality
+            HStack(spacing: 12) {
+                ControlButton(icon: "plus.circle.fill", size: 20) {
+                    appState.showingFilePicker = true
+                }
+                .disabled(!appState.isConnectedToAirPlay)
 
-            // Skip back
-            ControlButton(icon: "gobackward.10", size: 18) {
-                appState.seek(to: max(appState.playbackProgress - 10, 0))
+                MiniUltraToggle()
+
+                Spacer()
             }
-            .disabled(appState.selectedMediaURL == nil)
 
-            // Play/Pause (larger)
-            ControlButton(icon: appState.isPlaying ? "pause.circle.fill" : "play.circle.fill", size: 32) {
-                appState.togglePlayback()
+            // Right side: AirPlay
+            HStack {
+                Spacer()
+                AirPlayMiniButton()
             }
-            .disabled(appState.selectedMediaURL == nil)
-
-            // Skip forward
-            ControlButton(icon: "goforward.30", size: 18) {
-                appState.seek(to: min(appState.playbackProgress + 30, appState.duration))
-            }
-            .disabled(appState.selectedMediaURL == nil)
-
-            Spacer()
-
-            // AirPlay button
-            AirPlayMiniButton()
         }
+    }
+}
+
+// MARK: - Mini Quality Toggle (cycles between Ultra/High)
+struct MiniUltraToggle: View {
+    @EnvironmentObject var appState: AppState
+
+    var body: some View {
+        Button(action: {
+            appState.saveUltraQualityAudio(!appState.ultraQualityEnabled)
+        }) {
+            HStack(spacing: 4) {
+                Image(systemName: appState.ultraQualityEnabled ? "sparkles" : "film")
+                    .font(.system(size: 8, weight: .bold))
+                Text(appState.ultraQualityEnabled ? "Ultra" : "High")
+                    .font(.system(size: 9, weight: .semibold, design: .rounded))
+            }
+            .foregroundColor(appState.ultraQualityEnabled ? .black : .primary)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(
+                Capsule()
+                    .fill(appState.ultraQualityEnabled
+                        ? LinearGradient(
+                            colors: [Color.yellow, Color.orange],
+                            startPoint: .leading,
+                            endPoint: .trailing
+                          )
+                        : LinearGradient(
+                            colors: [Color.gray.opacity(0.2), Color.gray.opacity(0.15)],
+                            startPoint: .leading,
+                            endPoint: .trailing
+                          )
+                    )
+            )
+            .overlay(
+                Capsule()
+                    .stroke(appState.ultraQualityEnabled ? Color.orange.opacity(0.5) : Color.gray.opacity(0.3), lineWidth: 0.5)
+            )
+            .animation(.easeInOut(duration: 0.2), value: appState.ultraQualityEnabled)
+        }
+        .buttonStyle(.plain)
+        .help(appState.ultraQualityEnabled ? "Ultra: HEVC + 5.1 surround" : "High: H.264 + Stereo")
     }
 }
 
@@ -359,11 +358,44 @@ struct ControlButton: View {
 // MARK: - AirPlay Mini Button
 struct AirPlayMiniButton: View {
     @EnvironmentObject var appState: AppState
+    @State private var isPulsing: Bool = false
+    @State private var isPickerOpen: Bool = false
+
+    private var needsAttention: Bool {
+        !appState.isConnectedToAirPlay && appState.airPlayManager.isAirPlayAvailable
+    }
 
     var body: some View {
         ZStack {
-            AirPlayRoutePickerRepresentable()
-                .frame(width: 24, height: 24)
+            // Glow effect when needing attention (not connected)
+            if needsAttention {
+                Circle()
+                    .fill(Color.blue)
+                    .frame(width: 32, height: 32)
+                    .scaleEffect(isPulsing ? 1.4 : 1.0)
+                    .opacity(isPulsing ? 0.15 : 0.5)
+                    .animation(
+                        .easeInOut(duration: 1.2).repeatForever(autoreverses: true),
+                        value: isPulsing
+                    )
+            }
+
+            AirPlayRoutePickerRepresentable(
+                onRoutePickerWillBegin: {
+                    isPickerOpen = true
+                },
+                onRoutePickerDidEnd: {
+                    isPickerOpen = false
+                    // When picker closes, assume user selected a device
+                    // (We can't detect which device, so we set a generic "connected" state)
+                    // The actual device name will be detected when playback starts
+                    if appState.airPlayManager.isAirPlayAvailable && !appState.isConnectedToAirPlay {
+                        appState.isConnectedToAirPlay = true
+                        appState.saveCurrentDevice("AirPlay Device")
+                    }
+                }
+            )
+            .frame(width: 24, height: 24)
 
             // Connection indicator
             if appState.isConnectedToAirPlay {
@@ -371,6 +403,26 @@ struct AirPlayMiniButton: View {
                     .fill(.green)
                     .frame(width: 6, height: 6)
                     .offset(x: 10, y: -10)
+            }
+        }
+        .onAppear {
+            // Only start pulsing if needs attention
+            if needsAttention {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                    isPulsing = true
+                }
+            }
+        }
+        .onChange(of: appState.isConnectedToAirPlay) { _, isConnected in
+            // Stop pulsing when connected
+            if isConnected {
+                isPulsing = false
+            }
+        }
+        .onChange(of: appState.airPlayManager.isAirPlayAvailable) { _, isAvailable in
+            // Start pulsing when devices become available and not connected
+            if isAvailable && !appState.isConnectedToAirPlay {
+                isPulsing = true
             }
         }
     }

@@ -46,6 +46,9 @@ extension TranscodeManager {
             let analysis = try await MediaAnalyzer.analyze(url: url, ffprobePath: ffprobePath)
             logger.info("📊 \(analysis.summary)")
 
+            // Populate streaming info for UI display
+            await updateStreamingInfo(from: analysis, mode: mode)
+
             // Execute appropriate conversion path
             let result: URL
 
@@ -186,18 +189,49 @@ extension TranscodeManager {
         // Build FFmpeg arguments
         var arguments = ["-i", input.path]
 
+        // Sync correction flags - fix audio/video timestamp mismatches
+        arguments += [
+            "-async", "1",              // Resample audio to match video timestamps
+            "-vsync", "cfr",            // Constant frame rate for video consistency
+        ]
+
         // Video settings
         if videoCodec == "copy" {
             arguments += ["-c:v", "copy"]
         } else {
-            // Hardware encoding with profile based on mode
-            arguments += ["-c:v", videoCodec]
+            // Choose encoder based on quality mode and device HEVC support
+            // Ultra Quality + HEVC-capable device: Use HEVC for best quality
+            // Otherwise: Use H.264 for compatibility
+            let useHEVC = ultraQualityAudio && deviceSupportsHEVC
+            let encoder = useHEVC ? "hevc_videotoolbox" : videoCodec
 
-            // Smart TVs need Main profile, Apple TV can handle High
-            if mode == .smartTV {
-                arguments += ["-profile:v", "main", "-level", "4.0"]
+            arguments += ["-c:v", encoder]
+
+            // Convert 10-bit to 8-bit for VideoToolbox compatibility
+            arguments += ["-pix_fmt", "yuv420p"]
+
+            if useHEVC {
+                // HEVC: Add hvc1 tag for Apple device compatibility
+                arguments += ["-tag:v", "hvc1"]
+                logger.info("🎬 Using HEVC encoder for Ultra Quality (device: \(self.currentDeviceName ?? "unknown"))")
             } else {
-                arguments += ["-profile:v", "high", "-level", "4.1"]
+                // H.264: Set profile and level based on resolution
+                // Level 4.0: up to 1920x1080, Level 4.1: up to 2048x1080, Level 5.1: up to 4096x2160
+                let level: String
+                if let width = analysis.primaryVideo?.width, width > 1920 {
+                    level = "5.1"  // 4K content needs level 5.1
+                } else if mode == .smartTV {
+                    level = "4.0"  // Smart TVs: conservative level for 1080p
+                } else {
+                    level = "4.1"  // Apple TV: slightly higher for 1080p
+                }
+
+                // Smart TVs need Main profile, Apple TV can handle High
+                if mode == .smartTV {
+                    arguments += ["-profile:v", "main", "-level", level]
+                } else {
+                    arguments += ["-profile:v", "high", "-level", level]
+                }
             }
 
             // Bitrate based on resolution
@@ -211,7 +245,7 @@ extension TranscodeManager {
             arguments += ["-c:a", "aac", "-b:a", "320k", "-ac", "6"]
         } else {
             // Standard quality: 192kbps stereo (better compatibility)
-            arguments += ["-c:a", "aac", "-b:a", "192k"]
+            arguments += ["-c:a", "aac", "-b:a", "192k", "-ac", "2"]
         }
 
         // HLS settings
@@ -221,6 +255,7 @@ extension TranscodeManager {
             "-hls_list_size", "0",                // Keep all segments
             "-hls_flags", "independent_segments",
             "-hls_segment_type", "mpegts",
+            "-start_at_zero",                     // Reset timestamps to start at 0
             "-hls_segment_filename", segmentPattern,
             "-y",
             playlistPath
@@ -239,7 +274,7 @@ extension TranscodeManager {
         let segmentMonitor = HLSSegmentMonitor(hlsDirectory: hlsDir)
 
         do {
-            let playlistURL = try await segmentMonitor.waitForFirstSegment(timeout: timeout)
+            _ = try await segmentMonitor.waitForFirstSegment(timeout: timeout)
 
             // Start HTTP server to serve HLS
             let httpBaseURL = try httpServer.startServing(directory: hlsDir)
@@ -265,6 +300,68 @@ extension TranscodeManager {
             httpServer.forceStop()
             try? FileManager.default.removeItem(at: hlsDir)
             throw error
+        }
+    }
+
+    // MARK: - Streaming Info
+
+    /// Update streaming info properties for UI display
+    private func updateStreamingInfo(from analysis: MediaAnalysis, mode: CompatibilityMode) async {
+        // Resolution
+        let resolution: String
+        if let width = analysis.primaryVideo?.width {
+            if width > 1920 {
+                resolution = "4K"
+            } else if width > 1280 {
+                resolution = "1080p"
+            } else if width > 720 {
+                resolution = "720p"
+            } else {
+                resolution = "SD"
+            }
+        } else {
+            resolution = ""
+        }
+
+        // Video codec - depends on conversion path and settings
+        let videoCodec: String
+        switch analysis.conversionPath {
+        case .directPlayback:
+            // Direct playback - keep original codec
+            videoCodec = analysis.primaryVideo?.codecName.uppercased() ?? "H.264"
+        case .fastRemux:
+            // Container change only - keep original video
+            videoCodec = "H.264"
+        case .audioTranscode, .videoTranscode:
+            // Transcoding - use HEVC if Ultra Quality + supported device
+            let useHEVC = ultraQualityAudio && deviceSupportsHEVC
+            videoCodec = useHEVC ? "HEVC" : "H.264"
+        }
+
+        // Audio codec and channels - depends on conversion path
+        let audioCodec: String
+        let audioChannels: String
+
+        switch analysis.conversionPath {
+        case .directPlayback:
+            // Direct playback - keep original audio
+            audioCodec = analysis.primaryAudio?.codecName.uppercased() ?? "AAC"
+            if let channels = analysis.primaryAudio?.channels, channels >= 6 {
+                audioChannels = "5.1"
+            } else {
+                audioChannels = "Stereo"
+            }
+        case .fastRemux, .audioTranscode, .videoTranscode:
+            // Transcoding - always AAC output
+            audioCodec = "AAC"
+            audioChannels = ultraQualityAudio ? "5.1" : "Stereo"
+        }
+
+        await MainActor.run {
+            outputResolution = resolution
+            outputVideoCodec = videoCodec
+            outputAudioCodec = audioCodec
+            outputAudioChannels = audioChannels
         }
     }
 

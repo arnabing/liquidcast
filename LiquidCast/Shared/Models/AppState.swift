@@ -164,6 +164,12 @@ class AppState: ObservableObject {
 
     private var cancellables = Set<AnyCancellable>()
 
+    /// Generation counter to detect stale transcode completions
+    private var loadGeneration: Int = 0
+
+    /// Current load task (cancelled when new media is selected)
+    private var currentLoadTask: Task<Void, Never>?
+
     // MARK: - Cache Settings
 
     /// Days after which cached files are automatically deleted
@@ -338,6 +344,15 @@ class AppState: ObservableObject {
 
     func loadMedia(from url: URL) {
         appStateLogger.info("🎬 Loading media: \(url.lastPathComponent)")
+
+        // Cancel any previous load operation
+        currentLoadTask?.cancel()
+        transcodeManager.cancel()  // Kill any running FFmpeg process
+
+        // Increment generation to invalidate any stale completions
+        loadGeneration += 1
+        let thisGeneration = loadGeneration
+
         selectedMediaURL = url
         conversionError = nil
 
@@ -358,7 +373,7 @@ class AppState: ObservableObject {
         // It will return the original URL for compatible files (Path 0: direct playback)
         // or convert as needed (Path 1-3: remux, audio transcode, full transcode)
         // For HLS transcoding, pass startPosition so FFmpeg starts from resume point
-        Task {
+        currentLoadTask = Task {
             do {
                 let playableURL = try await transcodeManager.convertForAirPlay(
                     from: url,
@@ -366,6 +381,12 @@ class AppState: ObservableObject {
                     deviceName: currentAirPlayDevice,
                     startPosition: savedPosition
                 )
+
+                // Check if this load was superseded by a newer one
+                guard thisGeneration == loadGeneration else {
+                    appStateLogger.info("🚫 Ignoring stale load completion for: \(url.lastPathComponent)")
+                    return
+                }
 
                 if playableURL != url {
                     appStateLogger.info("✅ Ready to play: \(playableURL.lastPathComponent)")
@@ -394,6 +415,11 @@ class AppState: ObservableObject {
                     appStateLogger.info("▶️ HLS stream starting from \(Int(savedPosition))s (no seek needed)")
                 }
             } catch {
+                // Ignore cancellation errors from superseded loads
+                if Task.isCancelled {
+                    appStateLogger.info("🚫 Load cancelled for: \(url.lastPathComponent)")
+                    return
+                }
                 appStateLogger.error("❌ Failed to prepare media: \(error.localizedDescription)")
                 conversionError = error.localizedDescription
             }

@@ -20,10 +20,17 @@ class MediaPlayerController: NSObject, ObservableObject {
 
     var onPlaybackStateChanged: ((Bool) -> Void)?
     var onProgressChanged: ((Double, Double) -> Void)?
+    var onDurationChanged: ((Double) -> Void)?
+
+    // MARK: - Source Duration (for seeking beyond HLS duration)
+
+    /// Full source duration from ffprobe - allows seeking beyond transcoded portion
+    var sourceDuration: Double = 0
 
     // MARK: - Private Properties
 
     private var timeObserver: Any?
+    private var durationObserver: NSKeyValueObservation?
     private var cancellables = Set<AnyCancellable>()
 
     // MARK: - Sleep Prevention
@@ -199,6 +206,15 @@ class MediaPlayerController: NSObject, ObservableObject {
         self.playerItem = playerItem
         player?.replaceCurrentItem(with: playerItem)
         logger.info("📼 PlayerItem set on AVPlayer")
+
+        // Observe duration changes (critical for HLS streams where duration updates over time)
+        durationObserver = playerItem.observe(\.duration, options: [.new]) { [weak self] item, _ in
+            let duration = item.duration
+            if duration.isValid && !duration.isIndefinite && duration.seconds > 0 {
+                logger.info("⏱️ Duration updated: \(duration.seconds)s")
+                self?.onDurationChanged?(duration.seconds)
+            }
+        }
     }
 
     // MARK: - Playback Control
@@ -225,11 +241,32 @@ class MediaPlayerController: NSObject, ObservableObject {
     }
 
     func seek(to progress: Double) {
-        guard let duration = playerItem?.duration,
-              duration.isValid && !duration.isIndefinite else { return }
+        guard playerItem != nil else {
+            logger.warning("⏭️ Cannot seek: no player item")
+            return
+        }
 
-        let targetTime = CMTime(seconds: progress, preferredTimescale: CMTimeScale(NSEC_PER_SEC))
-        player?.seek(to: targetTime, toleranceBefore: .zero, toleranceAfter: .zero)
+        // Use source duration if available (allows seeking beyond HLS transcoded portion)
+        // Otherwise fall back to player item duration
+        let maxDuration: Double
+        if sourceDuration > 0 {
+            maxDuration = sourceDuration
+        } else if let duration = playerItem?.duration,
+                  duration.isValid && !duration.isIndefinite {
+            maxDuration = duration.seconds
+        } else {
+            logger.warning("⏭️ Cannot seek: duration unknown")
+            return
+        }
+
+        // Clamp to valid range
+        let clampedProgress = min(max(progress, 0), maxDuration)
+        let targetTime = CMTime(seconds: clampedProgress, preferredTimescale: CMTimeScale(NSEC_PER_SEC))
+
+        // Use tolerant seeking for HLS (faster, more reliable)
+        let tolerance = CMTime(seconds: 1.0, preferredTimescale: CMTimeScale(NSEC_PER_SEC))
+        player?.seek(to: targetTime, toleranceBefore: tolerance, toleranceAfter: tolerance)
+        logger.info("⏭️ Seeking to \(Int(clampedProgress))s (max: \(Int(maxDuration))s)")
     }
 
     func setVolume(_ volume: Float) {

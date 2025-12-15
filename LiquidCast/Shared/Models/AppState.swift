@@ -119,10 +119,18 @@ class AppState: ObservableObject {
     @Published var outputVideoCodec: String = ""     // "H.264" or "HEVC"
     @Published var outputAudioCodec: String = ""     // "AAC"
     @Published var outputAudioChannels: String = ""  // "5.1" or "Stereo"
+    @Published var sourceDuration: Double = 0        // Full source file duration (from ffprobe)
 
     // MARK: - Quality Settings (mirrored from TranscodeManager for SwiftUI binding)
 
     @Published var ultraQualityEnabled: Bool = false
+
+    // MARK: - Seeking State (for UI feedback and debouncing)
+
+    @Published var isSeeking: Bool = false              // True during seek operation
+    @Published var seekPreviewPosition: Double? = nil   // Preview position during drag (nil = not dragging)
+
+    private var seekDebounceTask: Task<Void, Never>? = nil
 
     /// Formatted streaming info for display
     var streamingInfoText: String {
@@ -151,6 +159,10 @@ class AppState: ObservableObject {
     let mediaPlayer = MediaPlayerController()
     let airPlayManager = AirPlayManager()
     let transcodeManager = TranscodeManager()
+
+    // MARK: - Private Properties
+
+    private var cancellables = Set<AnyCancellable>()
 
     // MARK: - Cache Settings
 
@@ -240,7 +252,10 @@ class AppState: ObservableObject {
         mediaPlayer.onProgressChanged = { [weak self] progress, duration in
             Task { @MainActor in
                 self?.playbackProgress = progress
-                self?.duration = duration
+                // Only update duration if valid and greater than current (HLS duration grows over time)
+                if duration > 0 && duration > (self?.duration ?? 0) {
+                    self?.duration = duration
+                }
 
                 // Save playback position periodically (every 5 seconds, after 10 seconds in)
                 if let url = self?.selectedMediaURL,
@@ -249,11 +264,25 @@ class AppState: ObservableObject {
                     CacheManager.savePlaybackPosition(for: url, position: progress)
                 }
 
-                // Clear position when near end (> 95% complete)
-                if progress > 0 && duration > 0 && progress / duration > 0.95 {
+                // Clear position when near end of SOURCE file (> 95% complete)
+                // Use sourceDuration (full movie length from ffprobe) not HLS duration
+                // to avoid premature clearing during live transcoding
+                let effectiveDuration = (self?.sourceDuration ?? 0) > 0 ? (self?.sourceDuration ?? 0) : duration
+                if progress > 0 && effectiveDuration > 0 && progress / effectiveDuration > 0.95 {
                     if let url = self?.selectedMediaURL {
                         CacheManager.clearPlaybackPosition(for: url)
                     }
+                }
+            }
+        }
+
+        // Duration can update separately for HLS streams as more segments are loaded
+        mediaPlayer.onDurationChanged = { [weak self] duration in
+            Task { @MainActor in
+                // Only update if new duration is greater (HLS duration grows as transcoding progresses)
+                if duration > (self?.duration ?? 0) {
+                    appStateLogger.info("⏱️ Duration updated to \(Int(duration))s")
+                    self?.duration = duration
                 }
             }
         }
@@ -291,6 +320,18 @@ class AppState: ObservableObject {
         transcodeManager.$outputAudioChannels
             .receive(on: DispatchQueue.main)
             .assign(to: &$outputAudioChannels)
+
+        transcodeManager.$sourceDuration
+            .receive(on: DispatchQueue.main)
+            .assign(to: &$sourceDuration)
+
+        // Pass source duration to media player (allows seeking beyond HLS transcoded portion)
+        transcodeManager.$sourceDuration
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] duration in
+                self?.mediaPlayer.sourceDuration = duration
+            }
+            .store(in: &cancellables)
     }
 
     // MARK: - Actions
@@ -306,15 +347,24 @@ class AppState: ObservableObject {
         // Clear previous streaming info
         clearStreamingInfo()
 
+        // Check for saved playback position to resume from
+        let savedPosition = CacheManager.getPlaybackPosition(for: url) ?? 0
+
+        if savedPosition > 0 {
+            appStateLogger.info("📍 Found saved position: \(Int(savedPosition))s for \(url.lastPathComponent)")
+        }
+
         // Always use TranscodeManager for smart format detection
         // It will return the original URL for compatible files (Path 0: direct playback)
         // or convert as needed (Path 1-3: remux, audio transcode, full transcode)
+        // For HLS transcoding, pass startPosition so FFmpeg starts from resume point
         Task {
             do {
                 let playableURL = try await transcodeManager.convertForAirPlay(
                     from: url,
                     mode: compatibilityMode,
-                    deviceName: currentAirPlayDevice
+                    deviceName: currentAirPlayDevice,
+                    startPosition: savedPosition
                 )
 
                 if playableURL != url {
@@ -323,26 +373,25 @@ class AppState: ObservableObject {
 
                 mediaPlayer.loadMedia(from: playableURL)
 
-                // Restore saved playback position after player is ready
-                // Use longer delay for HLS streams which need buffering time
-                let savedPosition = CacheManager.getPlaybackPosition(for: url)
-                if let position = savedPosition {
-                    appStateLogger.info("📍 Found saved position: \(Int(position))s for \(url.lastPathComponent)")
-                    let delay: Double = playableURL.scheme == "http" ? 3.0 : 1.0
+                // For direct playback files (not HLS), we still need to seek
+                // HLS streams already start from the correct position
+                if savedPosition > 0 && playableURL.scheme != "http" {
+                    appStateLogger.info("📍 Seeking to saved position for direct playback: \(Int(savedPosition))s")
+                    let delay: Double = 1.0
                     DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
                         guard let self = self, self.mediaPlayer.isReady else {
                             appStateLogger.warning("⏳ Player not ready for seek, retrying...")
                             DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-                                self?.seek(to: position)
-                                appStateLogger.info("▶️ Resumed from \(Int(position))s (retry)")
+                                self?.mediaPlayer.seek(to: savedPosition)
+                                appStateLogger.info("▶️ Resumed from \(Int(savedPosition))s (retry)")
                             }
                             return
                         }
-                        self.seek(to: position)
-                        appStateLogger.info("▶️ Resumed from \(Int(position))s")
+                        self.mediaPlayer.seek(to: savedPosition)
+                        appStateLogger.info("▶️ Resumed from \(Int(savedPosition))s")
                     }
-                } else {
-                    appStateLogger.info("📍 No saved position for \(url.lastPathComponent)")
+                } else if savedPosition > 0 {
+                    appStateLogger.info("▶️ HLS stream starting from \(Int(savedPosition))s (no seek needed)")
                 }
             } catch {
                 appStateLogger.error("❌ Failed to prepare media: \(error.localizedDescription)")
@@ -365,9 +414,76 @@ class AppState: ObservableObject {
         }
     }
 
-    func seek(to progress: Double) {
-        appStateLogger.info("⏭️ Seeking to: \(progress)")
-        mediaPlayer.seek(to: progress)
+    /// Debounced seek - waits 300ms before executing to prevent rapid seek spam
+    func debouncedSeek(to position: Double) {
+        // Cancel any pending seek
+        seekDebounceTask?.cancel()
+
+        // Show preview immediately (optimistic UI)
+        seekPreviewPosition = position
+        appStateLogger.info("⏭️ Seek preview: \(Int(position))s")
+
+        // Schedule actual seek after debounce delay
+        seekDebounceTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 300_000_000) // 300ms
+            guard !Task.isCancelled else { return }
+
+            // Keep seekPreviewPosition set during seek - only cleared in seekCompleted()
+            isSeeking = true
+            seek(to: position)
+        }
+    }
+
+    /// Called when seek operation completes
+    func seekCompleted() {
+        isSeeking = false
+        seekPreviewPosition = nil  // Clear preview now that seek is done
+        appStateLogger.info("✅ Seek completed")
+    }
+
+    func seek(to position: Double) {
+        appStateLogger.info("⏭️ Seeking to: \(position)")
+
+        // If seeking within transcoded range (with 10s buffer), use normal AVPlayer seek
+        // Also use normal seek if not streaming (direct playback or non-HLS)
+        if !isStreaming || position <= duration + 10 {
+            mediaPlayer.seek(to: position)
+            seekCompleted()
+            return
+        }
+
+        // Seeking beyond transcoded portion - restart FFmpeg from new position (YouTube-style)
+        guard let url = selectedMediaURL else {
+            appStateLogger.warning("⏭️ Cannot seek-restart: no source URL")
+            seekCompleted()
+            return
+        }
+
+        appStateLogger.info("🎯 Far seek detected: \(Int(position))s beyond transcoded \(Int(self.duration))s - restarting transcode")
+
+        Task {
+            do {
+                // Restart transcoding from seek position
+                let playableURL = try await transcodeManager.seekTranscode(
+                    to: position,
+                    from: url,
+                    mode: compatibilityMode
+                )
+
+                // Reset duration (will grow as new transcode progresses)
+                duration = 0
+
+                // Load new HLS stream
+                mediaPlayer.loadMedia(from: playableURL)
+
+                appStateLogger.info("✅ Seek-restart complete, playing from \(Int(position))s")
+                seekCompleted()
+            } catch {
+                appStateLogger.error("❌ Seek-restart failed: \(error.localizedDescription)")
+                conversionError = error.localizedDescription
+                seekCompleted()
+            }
+        }
     }
 
     func setVolume(_ volume: Float) {

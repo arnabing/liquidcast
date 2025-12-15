@@ -112,7 +112,14 @@ struct NowPlayingBar: View {
                                 .foregroundColor(.secondary)
                         }
 
-                        if appState.isConverting || appState.isStreaming {
+                        // Show seeking status (highest priority)
+                        if appState.isSeeking {
+                            Text("·")
+                                .foregroundColor(.secondary)
+                            Text("Seeking...")
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundColor(.blue)
+                        } else if appState.isConverting || appState.isStreaming {
                             Text("·")
                                 .foregroundColor(.secondary)
                             Text(appState.conversionStatus)
@@ -136,30 +143,19 @@ struct NowPlayingBar: View {
                     }
                     .buttonStyle(.plain)
                 } else {
-                    Text("Drop video file or click +")
-                        .font(.system(size: 14, weight: .medium))
-                        .foregroundColor(.secondary)
+                    // Clickable text to open file picker
+                    Button(action: {
+                        appState.showingFilePicker = true
+                    }) {
+                        Text("Drop video file or click here →")
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundColor(.blue)
+                    }
+                    .buttonStyle(.plain)
                 }
             }
 
             Spacer()
-
-            // AirPlay status
-            if appState.isConnectedToAirPlay {
-                HStack(spacing: 4) {
-                    Image(systemName: "airplayaudio")
-                        .font(.system(size: 12))
-                    if let device = appState.currentAirPlayDevice {
-                        Text(device)
-                            .font(.system(size: 11))
-                    }
-                }
-                .foregroundColor(.green)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(Color.green.opacity(0.15))
-                .clipShape(Capsule())
-            }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
@@ -170,7 +166,9 @@ struct NowPlayingBar: View {
     }
 
     private var statusColor: Color {
-        if appState.isConverting {
+        if appState.isSeeking {
+            return .blue  // Blue dot during seek
+        } else if appState.isConverting {
             return .orange
         } else if appState.isStreaming {
             return .cyan
@@ -184,53 +182,126 @@ struct NowPlayingBar: View {
     }
 }
 
-// MARK: - Playback Progress Bar
+// MARK: - Playback Progress Bar (YouTube-style)
 struct PlaybackProgressBar: View {
     @EnvironmentObject var appState: AppState
+    @State private var isHovering = false
+    @State private var isDragging = false
+    @State private var dragPosition: Double = 0
+
+    /// The duration to display (use source duration if available for full movie length)
+    private var displayDuration: Double {
+        appState.sourceDuration > 0 ? appState.sourceDuration : appState.duration
+    }
+
+    /// Whether transcoding is still in progress (not yet complete)
+    private var isTranscodingInProgress: Bool {
+        // Transcoding is in progress if we're streaming AND duration < sourceDuration
+        appState.isStreaming && appState.sourceDuration > 0 && appState.duration < appState.sourceDuration * 0.99
+    }
+
+    /// Display position: preview during drag/seek, actual during playback
+    private var displayPosition: Double {
+        if isDragging {
+            return dragPosition
+        }
+        if let preview = appState.seekPreviewPosition {
+            return preview
+        }
+        return appState.playbackProgress
+    }
 
     var body: some View {
         VStack(spacing: 4) {
             GeometryReader { geometry in
                 ZStack(alignment: .leading) {
-                    // Background track
-                    Capsule()
-                        .fill(Color.primary.opacity(0.1))
+                    // Background track (gray)
+                    RoundedRectangle(cornerRadius: 2)
+                        .fill(Color.gray.opacity(0.3))
+                        .frame(height: isHovering || isDragging ? 5 : 3)
 
-                    // Progress fill
-                    Capsule()
-                        .fill(
-                            LinearGradient(
-                                colors: [.blue, .purple],
-                                startPoint: .leading,
-                                endPoint: .trailing
-                            )
-                        )
-                        .frame(width: progressWidth(in: geometry))
+                    // Buffered/transcoded portion (light gray)
+                    if isTranscodingInProgress {
+                        RoundedRectangle(cornerRadius: 2)
+                            .fill(Color.gray.opacity(0.5))
+                            .frame(width: bufferedWidth(in: geometry), height: isHovering || isDragging ? 5 : 3)
+                    }
+
+                    // Progress bar (red - YouTube style) - uses displayPosition for real-time feedback
+                    RoundedRectangle(cornerRadius: 2)
+                        .fill(Color.red)
+                        .frame(width: progressWidth(for: displayPosition, in: geometry), height: isHovering || isDragging ? 5 : 3)
+
+                    // Thumb (red circle) - positioned at display position
+                    Circle()
+                        .fill(Color.red)
+                        .frame(width: isHovering || isDragging ? 12 : 0, height: isHovering || isDragging ? 12 : 0)
+                        .offset(x: max(progressWidth(for: displayPosition, in: geometry) - 6, 0))
+                        .opacity(isHovering || isDragging ? 1 : 0)
+
+                    // Loading indicator during seek (small spinner next to thumb)
+                    if appState.isSeeking {
+                        ProgressView()
+                            .scaleEffect(0.4)
+                            .frame(width: 16, height: 16)
+                            .offset(x: progressWidth(for: displayPosition, in: geometry) + 4, y: -2)
+                    }
+                }
+                .frame(height: 12)  // Larger hit area
+                .contentShape(Rectangle())
+                .onHover { hovering in
+                    withAnimation(.easeInOut(duration: 0.15)) {
+                        isHovering = hovering
+                    }
                 }
                 .gesture(
                     DragGesture(minimumDistance: 0)
+                        .onChanged { value in
+                            isDragging = true
+                            let ratio = min(max(value.location.x / geometry.size.width, 0), 1)
+                            dragPosition = ratio * displayDuration
+                        }
                         .onEnded { value in
-                            let progress = min(max(value.location.x / geometry.size.width, 0), 1)
-                            appState.seek(to: progress * appState.duration)
+                            isDragging = false
+                            let ratio = min(max(value.location.x / geometry.size.width, 0), 1)
+                            let targetPosition = ratio * displayDuration
+                            // Use debounced seek for better UX
+                            appState.debouncedSeek(to: targetPosition)
                         }
                 )
             }
-            .frame(height: 6)
+            .frame(height: 12)
 
             // Time display
             HStack {
-                Text(formatTime(appState.playbackProgress))
+                // Show preview time during drag, otherwise playback time
+                Text(formatTime(displayPosition))
                 Spacer()
-                Text(formatTime(appState.duration))
+                // Show spinner while transcoding is still in progress OR while seeking
+                if isTranscodingInProgress || appState.isSeeking {
+                    ProgressView()
+                        .scaleEffect(0.5)
+                        .frame(width: 12, height: 12)
+                }
+                Text(formatTime(displayDuration))
             }
             .font(.system(size: 11, weight: .medium, design: .monospaced))
             .foregroundColor(.secondary)
         }
     }
 
-    private func progressWidth(in geometry: GeometryProxy) -> CGFloat {
-        guard appState.duration > 0 else { return 0 }
-        return geometry.size.width * CGFloat(appState.playbackProgress / appState.duration)
+    /// Width of the buffered/transcoded portion (relative to source duration)
+    private func bufferedWidth(in geometry: GeometryProxy) -> CGFloat {
+        guard displayDuration > 0 else { return geometry.size.width }
+        let ratio = min(appState.duration / displayDuration, 1.0)
+        return geometry.size.width * CGFloat(ratio)
+    }
+
+    /// Width for a specific position (relative to source duration)
+    private func progressWidth(for position: Double, in geometry: GeometryProxy) -> CGFloat {
+        guard displayDuration > 0 else { return 0 }
+        let ratio = min(position / displayDuration, 1.0)
+        return geometry.size.width * CGFloat(ratio)
     }
 
     private func formatTime(_ seconds: Double) -> String {
@@ -268,7 +339,8 @@ struct ControlsBar: View {
 
                 // Skip forward
                 ControlButton(icon: "goforward.30", size: 18) {
-                    appState.seek(to: min(appState.playbackProgress + 30, appState.duration))
+                    let maxTime = appState.sourceDuration > 0 ? appState.sourceDuration : appState.duration
+                    appState.seek(to: min(appState.playbackProgress + 30, maxTime))
                 }
                 .disabled(appState.selectedMediaURL == nil)
             }

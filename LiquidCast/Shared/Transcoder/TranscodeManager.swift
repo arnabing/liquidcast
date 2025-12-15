@@ -45,11 +45,23 @@ class TranscodeManager: ObservableObject {
     @Published var outputVideoCodec: String = ""     // "H.264" or "HEVC"
     @Published var outputAudioCodec: String = ""     // "AAC"
     @Published var outputAudioChannels: String = ""  // "5.1" or "Stereo"
+    @Published var sourceDuration: Double = 0        // Full source file duration from ffprobe
 
     // MARK: - Internal Properties (accessed by extensions)
 
     var isCancelled = false
     var currentProcess: Any? = nil  // FFmpegProcess on macOS
+
+    // MARK: - Current Transcode State (for seek restart)
+
+    /// Current source URL being transcoded
+    var currentSourceURL: URL?
+    /// Current media analysis (cached for seek restart)
+    var currentAnalysis: MediaAnalysis?
+    /// Current compatibility mode
+    var currentMode: CompatibilityMode = .appleTV
+    /// Current seek offset (in seconds) - used when restarting from seek position
+    var currentSeekOffset: Double = 0
 
     // MARK: - HTTP Server (for HLS streaming over AirPlay)
 
@@ -75,15 +87,22 @@ class TranscodeManager: ObservableObject {
     ///   - url: Source file URL
     ///   - mode: Compatibility mode for target device (Apple TV allows more formats than Smart TVs)
     ///   - deviceName: Name of the AirPlay device (used for HEVC capability detection)
+    ///   - startPosition: Optional start position in seconds (for resuming playback)
     /// - Returns: URL to the converted MP4 file
-    func convertForAirPlay(from url: URL, mode: CompatibilityMode = .appleTV, deviceName: String? = nil) async throws -> URL {
+    func convertForAirPlay(from url: URL, mode: CompatibilityMode = .appleTV, deviceName: String? = nil, startPosition: Double = 0) async throws -> URL {
         currentDeviceName = deviceName
-        logger.info("🔄 convertForAirPlay called for: \(url.lastPathComponent) (mode: \(mode.rawValue), hevc: \(self.deviceSupportsHEVC))")
+        currentSeekOffset = startPosition
+
+        if startPosition > 0 {
+            logger.info("🔄 convertForAirPlay called for: \(url.lastPathComponent) (mode: \(mode.rawValue), hevc: \(self.deviceSupportsHEVC), startAt: \(Int(startPosition))s)")
+        } else {
+            logger.info("🔄 convertForAirPlay called for: \(url.lastPathComponent) (mode: \(mode.rawValue), hevc: \(self.deviceSupportsHEVC))")
+        }
 
         // Call the platform-specific implementation
         // macOS: TranscodeManagerMacOS.swift provides the real implementation
         // iOS: TranscodeManageriOS.swift provides a stub that throws
-        return try await performConversion(from: url, mode: mode)
+        return try await performConversion(from: url, mode: mode, startPosition: startPosition)
     }
 
     /// Cancel the current conversion
@@ -113,6 +132,22 @@ class TranscodeManager: ObservableObject {
         #if os(macOS)
         httpServer.stop()
         isStreaming = false
+        #endif
+    }
+
+    /// Restart transcoding from a specific position (for seeking beyond transcoded content)
+    /// - Parameters:
+    ///   - position: The seek position in seconds
+    ///   - sourceURL: The source file URL
+    ///   - mode: Compatibility mode for target device
+    /// - Returns: URL to the new HLS stream starting from the seek position
+    func seekTranscode(to position: Double, from sourceURL: URL, mode: CompatibilityMode) async throws -> URL {
+        logger.info("🎯 Seek-restart transcoding to \(Int(position))s")
+
+        #if os(macOS)
+        return try await performSeekTranscode(to: position, from: sourceURL, mode: mode)
+        #else
+        throw TranscodeError.notSupportedOnPlatform
         #endif
     }
 }

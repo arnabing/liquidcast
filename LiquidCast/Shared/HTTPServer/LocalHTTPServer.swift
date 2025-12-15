@@ -320,9 +320,7 @@ class LocalHTTPServer {
 
         var filteredLines: [String] = []
         let lines = playlistContent.components(separatedBy: "\n")
-        var skipNextSegment = false
-        var lastExistingSegmentIndex = -1
-        var segmentDurations: [(index: Int, extinf: String, segment: String)] = []
+        var existingSegments: [(extinf: String, segment: String)] = []
 
         // First pass: collect all segments and check existence
         var i = 0
@@ -337,13 +335,11 @@ class LocalHTTPServer {
                     if !segmentLine.isEmpty && !segmentLine.hasPrefix("#") {
                         let segmentURL = directory.appendingPathComponent(segmentLine)
                         if FileManager.default.fileExists(atPath: segmentURL.path) {
-                            // Extract segment number for ordering
-                            if let range = segmentLine.range(of: #"segment(\d+)"#, options: .regularExpression),
-                               let num = Int(segmentLine[range].dropFirst(7)) {
-                                segmentDurations.append((index: num, extinf: line, segment: segmentLine))
-                                lastExistingSegmentIndex = max(lastExistingSegmentIndex, num)
-                            } else {
-                                segmentDurations.append((index: segmentDurations.count, extinf: line, segment: segmentLine))
+                            // Verify segment is complete (> 10KB minimum to avoid partial writes)
+                            if let attrs = try? FileManager.default.attributesOfItem(atPath: segmentURL.path),
+                               let size = attrs[.size] as? Int64,
+                               size > 10_000 {
+                                existingSegments.append((extinf: line, segment: segmentLine))
                             }
                         }
                     }
@@ -353,9 +349,6 @@ class LocalHTTPServer {
             }
             i += 1
         }
-
-        // Sort segments by index (in case they were found out of order)
-        segmentDurations.sort { $0.index < $1.index }
 
         // Build filtered playlist
         // Copy header lines
@@ -371,8 +364,8 @@ class LocalHTTPServer {
             }
         }
 
-        // Add only existing segments
-        for segment in segmentDurations {
+        // Add only existing segments (in order)
+        for segment in existingSegments {
             filteredLines.append(segment.extinf)
             filteredLines.append(segment.segment)
         }
@@ -384,7 +377,7 @@ class LocalHTTPServer {
         if originalHasEndList {
             // Count segments in original playlist
             let originalSegmentCount = lines.filter { $0.hasSuffix(".ts") }.count
-            if segmentDurations.count >= originalSegmentCount {
+            if existingSegments.count >= originalSegmentCount {
                 filteredLines.append("#EXT-X-ENDLIST")
             }
         }

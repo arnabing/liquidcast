@@ -12,8 +12,17 @@ private let logger = Logger(subsystem: "com.liquidcast", category: "Transcoder")
 extension TranscodeManager {
 
     /// Main entry point for conversion
-    func performConversion(from url: URL, mode: CompatibilityMode = .appleTV) async throws -> URL {
-        logger.info("🎬 Converting: \(url.lastPathComponent) (mode: \(mode.rawValue))")
+    func performConversion(from url: URL, mode: CompatibilityMode = .appleTV, startPosition: Double = 0) async throws -> URL {
+        if startPosition > 0 {
+            logger.info("🎬 Converting: \(url.lastPathComponent) (mode: \(mode.rawValue), startAt: \(Int(startPosition))s)")
+        } else {
+            logger.info("🎬 Converting: \(url.lastPathComponent) (mode: \(mode.rawValue))")
+        }
+
+        // Store current state for potential seek-restart
+        currentSourceURL = url
+        currentMode = mode
+        currentSeekOffset = startPosition
 
         // Verify FFmpeg installation
         guard let ffmpegPath = findFFmpeg() else {
@@ -24,8 +33,8 @@ extension TranscodeManager {
             throw TranscodeError.ffmpegNotFound
         }
 
-        // Check cache first
-        if let cachedURL = CacheManager.cachedURL(for: url) {
+        // Check cache first (only if starting from beginning)
+        if startPosition == 0, let cachedURL = CacheManager.cachedURL(for: url) {
             if FileManager.default.fileExists(atPath: cachedURL.path) {
                 logger.info("✅ Using cached: \(cachedURL.lastPathComponent)")
                 return cachedURL
@@ -45,6 +54,17 @@ extension TranscodeManager {
             // Analyze media file
             let analysis = try await MediaAnalyzer.analyze(url: url, ffprobePath: ffprobePath)
             logger.info("📊 \(analysis.summary)")
+
+            // Store analysis for potential seek-restart
+            currentAnalysis = analysis
+
+            // Store source duration for seek bar display (full movie length)
+            if let duration = analysis.duration, duration > 0 {
+                await MainActor.run {
+                    sourceDuration = duration
+                }
+                logger.info("⏱️ Source duration: \(Int(duration))s (\(Int(duration/60))m)")
+            }
 
             // Populate streaming info for UI display
             await updateStreamingInfo(from: analysis, mode: mode)
@@ -77,7 +97,8 @@ extension TranscodeManager {
                     ffmpegPath: ffmpegPath,
                     analysis: analysis,
                     videoCodec: "copy",
-                    mode: mode
+                    mode: mode,
+                    startPosition: startPosition
                 )
 
             case .videoTranscode:
@@ -87,7 +108,8 @@ extension TranscodeManager {
                     ffmpegPath: ffmpegPath,
                     analysis: analysis,
                     videoCodec: "h264_videotoolbox",
-                    mode: mode
+                    mode: mode,
+                    startPosition: startPosition
                 )
             }
 
@@ -167,15 +189,17 @@ extension TranscodeManager {
 
     /// Perform HLS streaming transcode
     /// Allows playback to start immediately while conversion continues in background
+    /// - Parameter startPosition: Optional seek position to start transcoding from (in seconds)
     private func performHLSTranscode(
         input: URL,
         ffmpegPath: String,
         analysis: MediaAnalysis,
         videoCodec: String,
-        mode: CompatibilityMode
+        mode: CompatibilityMode,
+        startPosition: Double = 0
     ) async throws -> URL {
         await MainActor.run {
-            statusMessage = "Preparing stream..."
+            statusMessage = startPosition > 0 ? "Seeking..." : "Preparing stream..."
         }
 
         // Create HLS output directory
@@ -187,7 +211,15 @@ extension TranscodeManager {
         let segmentPattern = hlsDir.appendingPathComponent("segment%04d.ts").path
 
         // Build FFmpeg arguments
-        var arguments = ["-i", input.path]
+        var arguments: [String] = []
+
+        // Add seek BEFORE input for fast input seeking (doesn't decode frames before seek point)
+        if startPosition > 0 {
+            arguments += ["-ss", String(format: "%.3f", startPosition)]
+            logger.info("⏩ Fast-seeking to \(Int(startPosition))s before input")
+        }
+
+        arguments += ["-i", input.path]
 
         // Sync correction flags - fix audio/video timestamp mismatches
         arguments += [
@@ -460,5 +492,78 @@ extension TranscodeManager {
                 }
             }
         }
+    }
+
+    // MARK: - Seek Restart
+
+    /// Restart transcoding from a specific position (YouTube-style seeking)
+    /// Kills current FFmpeg, clears HLS directory, and restarts from new position
+    func performSeekTranscode(to position: Double, from sourceURL: URL, mode: CompatibilityMode) async throws -> URL {
+        logger.info("🎯 Seek-restart: killing current transcode, restarting from \(Int(position))s")
+
+        // 1. Kill current FFmpeg process
+        if let ffmpegProcess = currentProcess as? FFmpegProcess {
+            await ffmpegProcess.terminate()
+        }
+
+        // 2. Stop HTTP server
+        httpServer.forceStop()
+
+        // 3. Update state
+        await MainActor.run {
+            isConverting = true
+            isCancelled = false
+            progress = 0
+            statusMessage = "Seeking..."
+        }
+
+        // Store the new seek offset
+        currentSeekOffset = position
+
+        // Verify FFmpeg
+        guard let ffmpegPath = findFFmpeg() else {
+            throw TranscodeError.ffmpegNotFound
+        }
+
+        // Use cached analysis if available, otherwise re-analyze
+        let analysis: MediaAnalysis
+        if let cached = currentAnalysis {
+            analysis = cached
+        } else {
+            guard let ffprobePath = MediaAnalyzer.findFFprobe(ffmpegPath: ffmpegPath) else {
+                throw TranscodeError.ffmpegNotFound
+            }
+            analysis = try await MediaAnalyzer.analyze(url: sourceURL, ffprobePath: ffprobePath)
+            currentAnalysis = analysis
+        }
+
+        // Determine video codec based on conversion path
+        let videoCodec: String
+        switch analysis.conversionPath {
+        case .directPlayback, .fastRemux:
+            // These paths don't use HLS, but for seek we need to use HLS
+            // Fall through to audio transcode (copy video)
+            videoCodec = "copy"
+        case .audioTranscode:
+            videoCodec = "copy"
+        case .videoTranscode:
+            videoCodec = "h264_videotoolbox"
+        }
+
+        // Start HLS transcode from the seek position
+        let result = try await performHLSTranscode(
+            input: sourceURL,
+            ffmpegPath: ffmpegPath,
+            analysis: analysis,
+            videoCodec: videoCodec,
+            mode: mode,
+            startPosition: position
+        )
+
+        await MainActor.run {
+            isConverting = false
+        }
+
+        return result
     }
 }

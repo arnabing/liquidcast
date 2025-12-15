@@ -257,24 +257,30 @@ class AppState: ObservableObject {
 
         mediaPlayer.onProgressChanged = { [weak self] progress, duration in
             Task { @MainActor in
-                self?.playbackProgress = progress
+                // Add seek offset to get actual movie position
+                // HLS stream starts at 0, but movie may have started from offset (e.g., resume from 1565s)
+                let seekOffset = self?.transcodeManager.currentSeekOffset ?? 0
+                let actualProgress = progress + seekOffset
+                self?.playbackProgress = actualProgress
+
                 // Only update duration if valid and greater than current (HLS duration grows over time)
                 if duration > 0 && duration > (self?.duration ?? 0) {
                     self?.duration = duration
                 }
 
                 // Save playback position periodically (every 5 seconds, after 10 seconds in)
+                // Save the ACTUAL movie position, not raw HLS time
                 if let url = self?.selectedMediaURL,
-                   progress > 10,
-                   Int(progress) % 5 == 0 {
-                    CacheManager.savePlaybackPosition(for: url, position: progress)
+                   actualProgress > 10,
+                   Int(actualProgress) % 5 == 0 {
+                    CacheManager.savePlaybackPosition(for: url, position: actualProgress)
                 }
 
                 // Clear position when near end of SOURCE file (> 95% complete)
                 // Use sourceDuration (full movie length from ffprobe) not HLS duration
                 // to avoid premature clearing during live transcoding
                 let effectiveDuration = (self?.sourceDuration ?? 0) > 0 ? (self?.sourceDuration ?? 0) : duration
-                if progress > 0 && effectiveDuration > 0 && progress / effectiveDuration > 0.95 {
+                if actualProgress > 0 && effectiveDuration > 0 && actualProgress / effectiveDuration > 0.95 {
                     if let url = self?.selectedMediaURL {
                         CacheManager.clearPlaybackPosition(for: url)
                     }
@@ -468,12 +474,20 @@ class AppState: ObservableObject {
     }
 
     func seek(to position: Double) {
-        appStateLogger.info("⏭️ Seeking to: \(position)")
+        appStateLogger.info("⏭️ Seeking to movie position: \(Int(position))s")
 
-        // If seeking within transcoded range (with 10s buffer), use normal AVPlayer seek
+        // Convert movie time to HLS time (subtract the offset FFmpeg started from)
+        let seekOffset = transcodeManager.currentSeekOffset
+        let hlsPosition = position - seekOffset
+
+        appStateLogger.info("⏭️ HLS position: \(Int(hlsPosition))s (offset: \(Int(seekOffset))s, duration: \(Int(self.duration))s)")
+
+        // Check if within current HLS transcoded range
         // Also use normal seek if not streaming (direct playback or non-HLS)
-        if !isStreaming || position <= duration + 10 {
-            mediaPlayer.seek(to: position)
+        if !isStreaming || (hlsPosition >= 0 && hlsPosition <= duration + 10) {
+            // Seek within transcoded content - use raw HLS position
+            let clampedHLS = max(0, hlsPosition)  // Don't seek to negative
+            mediaPlayer.seek(to: clampedHLS)
             seekCompleted()
             return
         }
@@ -485,7 +499,7 @@ class AppState: ObservableObject {
             return
         }
 
-        appStateLogger.info("🎯 Far seek detected: \(Int(position))s beyond transcoded \(Int(self.duration))s - restarting transcode")
+        appStateLogger.info("🎯 Far seek detected: movie pos \(Int(position))s, HLS pos \(Int(hlsPosition))s beyond transcoded \(Int(self.duration))s - restarting transcode")
 
         Task {
             do {

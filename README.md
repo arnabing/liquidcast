@@ -1,29 +1,32 @@
 # LiquidCast
 
-A compact macOS app for casting **any video format** to Apple TV via AirPlay.
+**Cast any video to Apple TV in 4K with 5.1 surround sound.**
+
+A compact macOS app that plays MKV, AVI, and other formats on your Apple TV via AirPlay — with quality you can't tell from the original.
 
 ![Mini Player](docs/mini-player.png)
 
-## Features
+## Why LiquidCast?
 
-- **Play any video format** - MKV, AVI, MP4, MOV, WebM, etc.
-- **Smart transcoding** - Automatically converts incompatible formats via FFmpeg
-- **Compact mini player** - Winamp-style 320x120 window
-- **Menu bar integration** - Control playback from the menu bar
-- **Ultra Quality mode** - 320kbps 5.1 surround audio + higher video bitrates
+Apple TV only plays certain formats (MP4, MOV). Got an MKV with 5.1 audio? AVI from years ago? LiquidCast handles it:
+
+- **Any format plays** — MKV, AVI, WebM, MP4, MOV, whatever
+- **Original quality** — 4K video + 5.1 surround audio preserved
+- **Instant start** — Playback begins in seconds, not minutes
+- **Tiny footprint** — Winamp-style 320×120 mini player
 
 ## How It Works
 
-LiquidCast uses FFmpeg to convert videos for AirPlay compatibility:
+LiquidCast automatically picks the fastest path to play your video:
 
-| Your File | What Happens | Speed |
-|-----------|--------------|-------|
-| MP4 (H.264 + AAC) | Direct playback | Instant |
-| MKV (H.264 + AAC) | Quick remux to MP4 | ~2 seconds |
-| MKV (H.264 + DTS/AC3) | Audio transcode, video copy | Fast |
-| AVI (XviD/etc) | Full transcode via HLS | Starts in ~5s |
+| Your File | What Happens | Wait Time |
+|-----------|--------------|-----------|
+| MP4/MOV (H.264 + AAC) | Plays directly | None |
+| MKV (H.264 + AAC) | Quick repackage | ~2 sec |
+| MKV (H.264 + DTS/5.1) | Audio converted, video untouched | ~3 sec |
+| AVI/other formats | Full transcode via streaming | ~5 sec |
 
-For files needing transcode, playback starts immediately via HLS streaming while conversion continues in background.
+Videos stream while converting — no waiting for the whole file.
 
 ## Requirements
 
@@ -55,11 +58,13 @@ For files needing transcode, playback starts immediately via HLS streaming while
 | ⌘O | Open file |
 | ⌘Q | Quit |
 
-## Settings (Menu Bar)
+## Settings
 
-- **Ultra Quality** - Higher bitrates + 5.1 surround audio
-- **Target Device** - Apple TV (best quality) or Smart TV (wider compatibility)
-- **Clear Cache** - Remove converted files
+Access from the menu bar:
+
+- **Ultra Quality** — Maximum bitrates, 5.1 surround preserved
+- **Target Device** — Apple TV (best) or Smart TV (compatible)
+- **Clear Cache** — Delete converted files
 
 ## Project Structure
 
@@ -77,12 +82,12 @@ LiquidCast/
 └── iOS/                         # iOS support (limited)
 ```
 
-## Technical Details
+## Under the Hood
 
-- **HLS Streaming** - Converts to HTTP Live Streaming for immediate playback
-- **Hardware Encoding** - Uses VideoToolbox H.264 encoder
-- **Local HTTP Server** - Serves HLS segments to AirPlay (port 8765-8775)
-- **No external dependencies** - Uses only Apple frameworks + FFmpeg
+- **HLS Streaming** — Start watching while the file converts
+- **Hardware encoding** — Uses your Mac's VideoToolbox for speed
+- **Local server** — Streams to Apple TV over your network
+- **Minimal dependencies** — Just FFmpeg + Apple frameworks
 
 ## License
 

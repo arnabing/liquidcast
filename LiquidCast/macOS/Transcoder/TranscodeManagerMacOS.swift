@@ -501,15 +501,21 @@ extension TranscodeManager {
     func performSeekTranscode(to position: Double, from sourceURL: URL, mode: CompatibilityMode) async throws -> URL {
         logger.info("🎯 Seek-restart: killing current transcode, restarting from \(Int(position))s")
 
-        // 1. Kill current FFmpeg process
+        // 1. Force kill FFmpeg process (SIGKILL for immediate stop)
         if let ffmpegProcess = currentProcess as? FFmpegProcess {
-            await ffmpegProcess.terminate()
+            await ffmpegProcess.forceKill()
+        } else {
+            logger.warning("🎯 No current FFmpeg process to kill")
         }
 
         // 2. Stop HTTP server
+        logger.info("🎯 Stopping HTTP server...")
         httpServer.forceStop()
 
-        // 3. Update state
+        // 3. Small delay to ensure OS releases resources
+        try await Task.sleep(nanoseconds: 100_000_000)  // 100ms
+
+        // 4. Update state
         await MainActor.run {
             isConverting = true
             isCancelled = false

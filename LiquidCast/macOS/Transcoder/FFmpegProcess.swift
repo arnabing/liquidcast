@@ -129,7 +129,7 @@ actor FFmpegProcess {
         return nil
     }
 
-    /// Terminate the process
+    /// Terminate the process gracefully (SIGTERM)
     func terminate() {
         guard let process = process, process.isRunning else { return }
 
@@ -137,6 +137,26 @@ actor FFmpegProcess {
         state = .cancelled
         hasExited = true
         logger.info("[\(self.processId)] FFmpeg terminated by request")
+    }
+
+    /// Force kill the process immediately (SIGKILL) - use for seek-restart
+    func forceKill() {
+        guard let process = process else {
+            logger.warning("[\(self.processId)] forceKill: no process reference")
+            return
+        }
+
+        let pid = process.processIdentifier
+        if process.isRunning {
+            // Use SIGKILL for immediate termination (can't be caught/ignored)
+            kill(pid, SIGKILL)
+            logger.info("[\(self.processId)] FFmpeg force-killed (SIGKILL, pid: \(pid))")
+        } else {
+            logger.info("[\(self.processId)] FFmpeg already stopped (pid: \(pid))")
+        }
+
+        state = .cancelled
+        hasExited = true
     }
 
     /// Wait for process to finish with a timeout

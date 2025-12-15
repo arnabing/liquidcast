@@ -171,6 +171,12 @@ class LocalHTTPServer {
 
     /// Force stop regardless of state - use for cleanup on errors
     func forceStop() {
+        let connCount = connections.count
+        let hadListener = listener != nil
+        let sid = sessionId ?? "none"
+
+        logger.info("[\(sid)] forceStop: cancelling \(connCount) connections, listener=\(hadListener)")
+
         for connection in connections {
             connection.cancel()
         }
@@ -179,9 +185,7 @@ class LocalHTTPServer {
         listener?.cancel()
         listener = nil
 
-        if sessionId != nil {
-            logger.info("[\(self.sessionId ?? "?")] HTTP server stopped")
-        }
+        logger.info("[\(sid)] HTTP server stopped")
 
         servingDirectory = nil
         assignedPort = 0

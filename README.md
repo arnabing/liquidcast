@@ -28,17 +28,29 @@ LiquidCast automatically picks the fastest path to play your video:
 
 Videos stream while converting — no waiting for the whole file.
 
+## Download
+
+**[Download LiquidCast v0.1.0](https://github.com/arnabing/liquidcast/releases/latest)** (949 KB)
+
+### First-time setup
+
+1. Install FFmpeg (required for video conversion):
+   ```bash
+   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+   brew install ffmpeg
+   ```
+2. Download and open the DMG
+3. Drag LiquidCast to Applications
+4. Right-click → Open (first launch only, to bypass Gatekeeper)
+
 ## Requirements
 
 - **macOS 13.0+** (Ventura or later)
-- **FFmpeg** - Install with Homebrew:
-  ```bash
-  brew install ffmpeg
-  ```
+- **FFmpeg** — LiquidCast uses FFmpeg for transcoding. Without it, only MP4/MOV files will play.
 
-## Installation
+## Build from Source
 
-1. Clone or download this repo
+1. Clone this repo
 2. Open `LiquidCast.xcodeproj` in Xcode 15+
 3. Build and run (Cmd+R)
 
@@ -91,4 +103,4 @@ LiquidCast/
 
 ## License
 
-Private project.
+[MIT License](LICENSE)

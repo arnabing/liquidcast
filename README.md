@@ -91,4 +91,4 @@ LiquidCast/
 
 ## License
 
-Private project.
+[MIT License](LICENSE)

@@ -8,8 +8,6 @@ A compact macOS app that plays MKV, AVI, and other formats on your Apple TV via 
 
 <img width="778" height="303" alt="Screenshot 2025-12-15 at 11 22 18 PM" src="https://github.com/user-attachments/assets/ac4f3bbb-9ffd-46c5-93b8-75a26b2987f7" />
 
-![Mini Player](docs/mini-player.png)
-
 ## Why LiquidCast?
 
 Apple TV only plays certain formats (MP4, MOV). Got an MKV with 5.1 audio? AVI from years ago? LiquidCast handles it:

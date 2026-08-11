@@ -1,10 +1,12 @@
+
+
 # LiquidCast
 
 **Cast any video to Apple TV in 4K with 5.1 surround sound.**
 
 A compact macOS app that plays MKV, AVI, and other formats on your Apple TV via AirPlay — with quality you can't tell from the original.
 
-<img width="612" height="324" alt="Screenshot 2025-12-15 at 11 22 13 PM" src="https://github.com/user-attachments/assets/862d798b-ce8e-4a25-b766-9fe8aa85112d" />
+<img width="612" height="324" alt="Screenshot 2025-12-15 at 11 22 13 PM" src="https://github.com/user-attachments/assets/862d798b-ce8e-4a25-b766-9fe8aa85112d" />
 
 ## Why LiquidCast?
 
@@ -13,7 +15,7 @@ Apple TV only plays certain formats (MP4, MOV). Got an MKV with 5.1 audio? AVI f
 - **Any format plays** — MKV, AVI, WebM, MP4, MOV, whatever
 - **Original quality** — 4K video + 5.1 surround audio preserved
 - **Instant start** — Playback begins in seconds, not minutes
-- **Tiny footprint** — Winamp-style 320×120 mini player
+- **Tiny footprint** — Winamp-style 500×180 mini player
 
 ## How It Works
 

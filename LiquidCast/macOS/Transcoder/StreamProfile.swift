@@ -21,12 +21,28 @@ import Foundation
 ///   - copy: the demuxer lands on an *indexed* keyframe, which may be well before the seek (MKV cues
 ///     don't list every keyframe) or after it (MPEG-TS seeks forward). The session probes exactly
 ///     where (`KeyframeIndex.seekLanding`) and backs the seek off until it lands before the boundary
+///
+/// Containers: MPEG-TS for H.264. Fragmented MP4 for HEVC passthrough (Apple's HLS spec requires
+/// fMP4 for HEVC): the segment muxer writes each segment as a self-contained fragmented MP4, with
+/// `frag_discont` + `use_editlist=1` so fragment decode times (`tfdt`) are absolute, not reset per
+/// file. See `MP4Segment` for how they're served.
 struct StreamProfile {
     enum Video: Equatable {
-        /// Stream-copy H.264 (boundaries must be source keyframes)
+        /// Stream-copy (boundaries must be source keyframes): H.264, or HEVC for capable receivers
         case copy
-        /// Re-encode with VideoToolbox H.264 (level chosen by the encoder from resolution and frame rate)
-        case encode(bitrateKbps: Int, profile: String)
+        /// Re-encode with VideoToolbox H.264 (level chosen by the encoder from resolution and frame rate).
+        /// `toneMap`: the source is HDR, convert it to SDR (BT.709) instead of showing it washed out.
+        case encode(bitrateKbps: Int, profile: String, toneMap: Bool)
+    }
+
+    enum SegmentFormat {
+        case mpegts
+        case fmp4
+
+        var fileExtension: String { self == .mpegts ? "ts" : "mp4" }
+        /// Extension in segment URLs
+        var urlExtension: String { self == .mpegts ? "ts" : "m4s" }
+        var contentType: String { self == .mpegts ? "video/mp2t" : "video/iso.segment" }
     }
 
     /// Absolute stream indices (ffprobe `index`)
@@ -37,6 +53,11 @@ struct StreamProfile {
     let audioChannels: Int
     /// Resample to this rate (nil = keep the source rate)
     var audioSampleRate: Int? = nil
+    var segmentFormat: SegmentFormat = .mpegts
+    /// Remove Dolby Vision metadata, leaving the HDR10-compatible base layer (DV profiles 7 and 8)
+    var stripDolbyVision = false
+    /// Tone mapping only: scale to this size first (4K → 1080p keeps software tone mapping ~3.5× realtime)
+    var toneMapSize: (width: Int, height: Int)? = nil
 
     /// Added to every output timestamp. Keeps B-frame DTS positive at media time 0, so FFmpeg
     /// never shifts the first job's timestamps differently from later jobs.
@@ -59,7 +80,7 @@ struct StreamProfile {
     }
 
     /// FFmpeg arguments for a job that produces segments `startIndex...` of `plan`.
-    /// Writes `<filePrefix>%05d.ts` (absolute segment index) and appends each finished segment
+    /// Writes `<filePrefix>%05d.<ts|mp4>` (absolute segment index) and appends each finished segment
     /// to `segmentListURL` (CSV) only after the file is fully written.
     /// - Parameters:
     ///   - seek: Input seek position (0 = none). For `startIndex > 0`, must make the demuxer land
@@ -101,12 +122,29 @@ struct StreamProfile {
         if let audioStreamIndex {
             args += ["-map", "0:\(audioStreamIndex)"]
         }
-        args += ["-sn", "-dn"]  // Text subtitles can't go into MPEG-TS and would fail the job
+        args += ["-sn", "-dn"]  // Subtitles aren't streamed (text subtitles can't go into MPEG-TS and would fail the job)
 
         switch video {
         case .copy:
             args += ["-c:v", "copy"]
-        case .encode(let bitrateKbps, let profile):
+            if segmentFormat == .fmp4 {
+                args += ["-tag:v", "hvc1"]  // Apple players require hvc1, not hev1
+            }
+            if stripDolbyVision {
+                args += ["-bsf:v", "dovi_rpu=strip=1"]
+            }
+        case .encode(let bitrateKbps, let profile, let toneMap):
+            if toneMap {
+                // HDR (PQ/HLG) → SDR BT.709: linearize, map highlights (Hable), re-encode the transfer.
+                // Input primaries/matrix are stated (always BT.2020 for PQ/HLG): files often leave them
+                // untagged, and zscale then fails with "no path between colorspaces".
+                let scale = toneMapSize.map { "w=\($0.width):h=\($0.height):" } ?? ""
+                args += [
+                    "-vf", "zscale=\(scale)t=linear:npl=100:pin=bt2020:min=bt2020nc:p=bt2020,format=gbrpf32le,"
+                        + "zscale=p=bt709,tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=nv12",
+                    "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
+                ]
+            }
             args += [
                 "-fps_mode", "passthrough",       // Keep source frame times (segment muxer would default to CFR)
                 "-enc_time_base", "1:90000",      // ...at full precision
@@ -137,7 +175,7 @@ struct StreamProfile {
         args += ["-output_ts_offset", Self.format(Self.timestampBase + seek)]
         args += [
             "-f", "segment",
-            "-segment_format", "mpegts",
+            "-segment_format", segmentFormat == .mpegts ? "mpegts" : "mp4",
             "-segment_start_number", "\(firstFileIndex)",
             "-segment_list", segmentListURL.path,
             "-segment_list_type", "csv",
@@ -148,7 +186,11 @@ struct StreamProfile {
                 "-segment_time_delta", Self.format(cutTolerance),
             ]
         }
-        args += [outputDirectory.appendingPathComponent("\(filePrefix)%05d.ts").path]
+        if segmentFormat == .fmp4 {
+            args += ["-segment_format_options",
+                     "movflags=+frag_keyframe+empty_moov+default_base_moof+frag_discont:use_editlist=1"]
+        }
+        args += [outputDirectory.appendingPathComponent("\(filePrefix)%05d.\(segmentFormat.fileExtension)").path]
         return args
     }
 
@@ -159,25 +201,41 @@ struct StreamProfile {
 
 extension StreamProfile {
     /// Pick the profile for an analyzed source.
-    /// - Parameter forceEncode: Re-encode even if the video could be stream-copied
+    /// - Parameters:
+    ///   - allowHEVC: The receiver plays HEVC (and HDR): pass suitable HEVC through untouched
+    ///   - forceEncode: Re-encode even if the video could be stream-copied
     /// - Returns: nil if the source has no usable video stream.
     static func make(
         for analysis: MediaAnalysis,
         mode: CompatibilityMode,
         ultraQuality: Bool,
+        allowHEVC: Bool,
         forceEncode: Bool = false
     ) -> StreamProfile? {
         guard let video = analysis.primaryVideo else { return nil }
 
         let videoMode: Video
-        switch forceEncode ? .videoTranscode : analysis.conversionPath {
-        case .directPlayback, .fastRemux, .audioTranscode:
+        var segmentFormat = SegmentFormat.mpegts
+        var toneMapSize: (width: Int, height: Int)?
+        if !forceEncode && allowHEVC && analysis.isPassthroughHEVC {
             videoMode = .copy
-        case .videoTranscode:
-            videoMode = .encode(
-                bitrateKbps: bitrateKbps(width: video.width, ultraQuality: ultraQuality),
-                profile: mode == .smartTV ? "main" : "high"
-            )
+            segmentFormat = .fmp4
+        } else {
+            switch forceEncode ? .videoTranscode : analysis.conversionPath {
+            case .directPlayback, .fastRemux, .audioTranscode:
+                videoMode = .copy
+            case .videoTranscode:
+                let toneMap = analysis.videoRange != .sdr
+                // Software tone mapping at 4K barely keeps up; SDR receivers are mostly 1080p anyway
+                if toneMap, let width = video.width, let height = video.height, width > 1920 {
+                    toneMapSize = (1920, Int((Double(height) * 1920 / Double(width) / 2).rounded()) * 2)
+                }
+                videoMode = .encode(
+                    bitrateKbps: bitrateKbps(width: toneMapSize?.width ?? video.width, ultraQuality: ultraQuality),
+                    profile: mode == .smartTV ? "main" : "high",
+                    toneMap: toneMap
+                )
+            }
         }
 
         // Standard layouts only: mono, stereo, 5.1. Ultra keeps 5.1 (never upmixes); standard is stereo.
@@ -197,7 +255,10 @@ extension StreamProfile {
             video: videoMode,
             audioBitrateKbps: ultraQuality ? 320 : 192,
             audioChannels: channels,
-            audioSampleRate: sampleRate
+            audioSampleRate: sampleRate,
+            segmentFormat: segmentFormat,
+            stripDolbyVision: segmentFormat == .fmp4 && video.dolbyVisionProfile != nil,
+            toneMapSize: toneMapSize
         )
     }
 

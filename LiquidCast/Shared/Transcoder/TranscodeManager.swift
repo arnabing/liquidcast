@@ -39,17 +39,20 @@ class TranscodeManager: ObservableObject {
 
     // Streaming info (populated after media analysis)
     @Published var outputResolution: String = ""     // "1080p" or "4K"
-    @Published var outputVideoCodec: String = ""     // "H.264"
+    @Published var outputVideoCodec: String = ""     // "H.264", "HEVC", "HEVC HDR10"
     @Published var outputAudioCodec: String = ""     // "AAC"
     @Published var outputAudioChannels: String = ""  // "5.1" or "Stereo"
     @Published var sourceDuration: Double = 0        // Full source file duration from ffprobe
+
+    /// The current stream passes HEVC through (the receiver must decode HEVC)
+    var isHEVCPassthrough = false
 
     // MARK: - Streaming (macOS)
 
     #if os(macOS)
     /// Sessions the HTTP server may route to (read from the server's threads)
     let sessionRegistry = HLSSessionRegistry()
-    /// Serves `/<session>/playlist.m3u8` and `/<session>/<index>.ts`. Started on first use, kept for the app's lifetime.
+    /// Serves `/<session>/...` (playlists, init, segments). Started on first use, kept for the app's lifetime.
     lazy var httpServer = LocalHTTPServer(handler: Self.makeRequestHandler(registry: sessionRegistry))
     var activeSession: HLSSession?
     /// Bumped on every prepare/stop, so a superseded preparation can tell it lost the race
@@ -64,14 +67,17 @@ class TranscodeManager: ObservableObject {
     ///   - mode: Compatibility mode for target device (Apple TV allows more formats than Smart TVs)
     ///   - startPosition: Resume position in seconds. HLS streams start there by themselves;
     ///     for a returned file URL the caller seeks.
+    ///   - allowHEVC: The receiver decodes HEVC/HDR (Apple TV 4K): pass HEVC through untouched
     /// - Returns: The file URL itself (directly playable) or an http:// HLS playlist URL
-    func prepareForAirPlay(from url: URL, mode: CompatibilityMode = .appleTV, startPosition: Double = 0) async throws -> URL {
-        logger.info("🔄 Preparing \(url.lastPathComponent) (mode: \(mode.rawValue), start: \(Int(startPosition))s)")
-        return try await performPreparation(from: url, mode: mode, startPosition: startPosition)
+    func prepareForAirPlay(from url: URL, mode: CompatibilityMode = .appleTV, startPosition: Double = 0,
+                           allowHEVC: Bool = false) async throws -> URL {
+        logger.info("🔄 Preparing \(url.lastPathComponent) (mode: \(mode.rawValue), start: \(Int(startPosition))s, HEVC: \(allowHEVC))")
+        return try await performPreparation(from: url, mode: mode, startPosition: startPosition, allowHEVC: allowHEVC)
     }
 
     /// Stop the current stream (kills FFmpeg, deletes its segments)
     func stopStreaming() {
+        isHEVCPassthrough = false
         #if os(macOS)
         preparationGeneration += 1
         if let session = activeSession {

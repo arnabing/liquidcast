@@ -49,8 +49,17 @@ actor HLSSession {
 
     nonisolated let id: String
     nonisolated let plan: SegmentPlan
-    /// Complete VOD playlist (immutable for the session)
-    nonisolated let playlist: String
+    nonisolated let segmentFormat: StreamProfile.SegmentFormat
+    /// Complete VOD media playlist (immutable for the session)
+    nonisolated let mediaPlaylist: String
+    /// Multivariant playlist pointing at `mediaPlaylistName` (fMP4/HEVC streams, which need CODECS
+    /// and VIDEO-RANGE declared); nil when the media playlist is served directly
+    nonisolated let masterPlaylist: String?
+    nonisolated static let mediaPlaylistName = "media.m3u8"
+    nonisolated static let initSegmentName = "init.mp4"
+
+    /// What the player is given first
+    nonisolated var entryPlaylist: String { masterPlaylist ?? mediaPlaylist }
 
     private let source: URL
     private let sourceStartTime: Double
@@ -93,12 +102,16 @@ actor HLSSession {
     private var producibleEnd: Int
     private var monitorTask: Task<Void, Never>?
     private var isStopped = false
+    /// fMP4: the shared init segment, cut from the first segment file
+    private var initSegmentData: Data?
 
+    /// - Parameter variant: fMP4 only: describes the stream for the multivariant playlist
     init(
         source: URL,
         sourceStartTime: Double,
         plan: SegmentPlan,
         profile: StreamProfile,
+        variant: HLSVariant?,
         ffmpegPath: String,
         rootDirectory: URL,
         startTime: Double
@@ -106,7 +119,14 @@ actor HLSSession {
         let id = UUID().uuidString.lowercased()
         self.id = id
         self.plan = plan
-        self.playlist = plan.playlist(startTime: startTime)
+        self.segmentFormat = profile.segmentFormat
+        let isFMP4 = profile.segmentFormat == .fmp4
+        self.mediaPlaylist = plan.playlist(
+            startTime: startTime,
+            segmentExtension: profile.segmentFormat.urlExtension,
+            initURI: isFMP4 ? Self.initSegmentName : nil
+        )
+        self.masterPlaylist = isFMP4 ? variant?.masterPlaylist(mediaURI: Self.mediaPlaylistName) : nil
         self.source = source
         self.sourceStartTime = sourceStartTime
         self.profile = profile
@@ -162,6 +182,38 @@ actor HLSSession {
         }
         if let url = segments[index] { return url }  // May have landed while awaiting
         return try await waitForSegment(index)
+    }
+
+    /// fMP4 init segment (`ftyp`+`moov`). Every segment file starts with the same one, so it's taken
+    /// from whichever segment exists first, waiting for the running job's next one if none does yet.
+    /// Doesn't count as a request (no effect on throttling/eviction), and survives a seek replacing
+    /// the job while it waits.
+    func initSegment() async throws -> Data {
+        guard segmentFormat == .fmp4 else { throw SessionError.notFound }
+
+        for _ in 0..<5 {
+            if let initSegmentData { return initSegmentData }
+            if let file = segments.values.first {
+                // No await between picking the file and reading it, so eviction can't delete it in between
+                guard let data = MP4Segment.initSection(of: try Data(contentsOf: file, options: .alwaysMapped)) else {
+                    throw SessionError.transcodeFailed("Segment has no init section")
+                }
+                initSegmentData = data
+                return data
+            }
+            guard !isStopped else { throw SessionError.stopped }
+            if let job, job.nextIndex < producibleEnd {
+                do {
+                    _ = try await waitForSegment(job.nextIndex)
+                } catch SessionError.superseded {
+                    continue  // A seek replaced the job; wait for the new one's first segment
+                }
+            } else {
+                guard producibleEnd > 0 else { throw SessionError.notFound }
+                try await startJob(at: min(lastRequestedIndex, producibleEnd - 1))
+            }
+        }
+        throw SessionError.timedOut
     }
 
     /// Whether the running job will produce `index` soon
@@ -353,7 +405,8 @@ actor HLSSession {
     private func removeUnlistedFiles(of job: Job) {
         let served = Set(segments.values.map(\.lastPathComponent))
         let files = (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []
-        for file in files where file.hasPrefix(job.filePrefix) && file.hasSuffix(".ts") && !served.contains(file) {
+        for file in files where file.hasPrefix(job.filePrefix) && file.hasSuffix("." + segmentFormat.fileExtension)
+            && !served.contains(file) {
             try? FileManager.default.removeItem(at: directory.appendingPathComponent(file))
         }
     }

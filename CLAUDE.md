@@ -37,7 +37,8 @@ LiquidCast is a macOS app for casting any video format to Apple TV via AirPlay. 
 
 **On-demand HLS** (`macOS/Transcoder/`) - read `docs/STREAMING.md` before changing anything here
 - `SegmentPlan`: all segment boundaries decided up front → complete VOD playlist (full duration, native seeking, resume via `EXT-X-START`)
-- `StreamProfile`: copy (8-bit H.264) or re-encode (VideoToolbox H.264); FFmpeg args for a job starting at any segment
+- `StreamProfile`: copy (8-bit H.264 → MPEG-TS; HEVC/HDR → fMP4 when the receiver plays HEVC) or re-encode (VideoToolbox H.264, HDR tone-mapped); FFmpeg args for a job starting at any segment
+- `MP4Segment`: fMP4 init/media sections, HEVC codec string; `HLSVariant` (in `SegmentPlan.swift`) renders the multivariant playlist (CODECS, VIDEO-RANGE, FRAME-RATE)
 - `HLSSession`: serve finished segment / wait for the running job / restart FFmpeg at the requested segment; pauses FFmpeg when far ahead
 - `KeyframeIndex`: keyframe scan for stream copy (cached), and where an FFmpeg seek actually lands
 - `FFmpegProcess`: actor around the subprocess; never blocks (no `waitUntilExit`), SIGKILL/SIGSTOP, `killAll()` on quit
@@ -49,7 +50,7 @@ LiquidCast is a macOS app for casting any video format to Apple TV via AirPlay. 
 
 **LocalHTTPServer** (`Shared/HTTPServer/LocalHTTPServer.swift`)
 - Network.framework HTTP/1.1, off the main thread, async request handlers (a segment request can wait)
-- Routes `/<session>/playlist.m3u8` and `/<session>/<n>.ts`; ports 8765-8775, 9876-9885
+- Routes per session: `playlist.m3u8` (multivariant for HEVC, else media), `media.m3u8`, `init.mp4`, `<n>.ts` / `<n>.m4s`; ports 8765-8775, 9876-9885
 - Required because AirPlay needs http:// URLs reachable from the receiver
 
 ### UI Components
@@ -71,7 +72,7 @@ LiquidCast is a macOS app for casting any video format to Apple TV via AirPlay. 
 - Video peaks are capped at 1.5x the target (`-maxrate`) so Wi-Fi delivery doesn't stall
 
 **Compatibility Mode** (`appState.compatibilityMode`)
-- `.appleTV`: H.264 High profile allowed
+- `.appleTV`: H.264 High profile allowed; HEVC/HDR passed through untouched (falls back to H.264 per device if it fails)
 - `.smartTV`: H.264 Main profile for wider compatibility
 
 ## Project Structure
@@ -105,6 +106,7 @@ LiquidCast/
 │       ├── SegmentPlan.swift         # boundaries + VOD playlist
 │       ├── StreamProfile.swift       # FFmpeg arguments per job
 │       ├── KeyframeIndex.swift       # keyframe scan, seek landing probe
+│       ├── MP4Segment.swift          # fMP4 init/media sections, HEVC codec string
 │       └── FFmpegProcess.swift       # subprocess actor
 └── iOS/
     └── Transcoder/

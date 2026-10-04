@@ -144,6 +144,11 @@ struct MenuBarContentView: View {
             Button("Clear Cache (\(CacheManager.formattedCacheSize()))") {
                 CacheManager.clearAllCache()
             }
+
+            // Devices that once failed HEVC get H.264; let the user retry (e.g. new Apple TV 4K)
+            Button("Retry HEVC/HDR on All Devices") {
+                appState.resetHEVCUnsupportedDevices()
+            }
         }
 
         Divider()

@@ -21,6 +21,8 @@ class MediaPlayerController: NSObject, ObservableObject {
     var onPlaybackStateChanged: ((Bool) -> Void)?
     /// True while the player wants to play but is waiting for data
     var onBufferingChanged: ((Bool) -> Void)?
+    /// The current item can't be played (e.g. the AirPlay receiver can't decode it)
+    var onItemFailed: ((Error?) -> Void)?
     var onProgressChanged: ((Double, Double) -> Void)?
     var onDurationChanged: ((Double) -> Void)?
 
@@ -204,11 +206,22 @@ class MediaPlayerController: NSObject, ObservableObject {
                     logger.error("❌ PlayerItem failed: \(playerItem.error?.localizedDescription ?? "unknown")")
                     self?.isReady = false
                     self?.error = playerItem.error
+                    self?.onItemFailed?(playerItem.error)
                 case .unknown:
                     logger.info("⏳ PlayerItem status unknown (loading...)")
                 @unknown default:
                     break
                 }
+            }
+            .store(in: &itemCancellables)
+
+        // Fails mid-playback (after readyToPlay) are reported here rather than via status
+        NotificationCenter.default.publisher(for: AVPlayerItem.failedToPlayToEndTimeNotification, object: playerItem)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] notification in
+                let error = notification.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error
+                logger.error("❌ PlayerItem failed to play to end: \(error?.localizedDescription ?? "unknown")")
+                self?.onItemFailed?(error)
             }
             .store(in: &itemCancellables)
 

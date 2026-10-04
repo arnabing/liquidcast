@@ -10,10 +10,12 @@ private let logger = Logger(subsystem: "com.liquidcast", category: "Transcoder")
 /// |-----------------------------------------|----------------------------------------------|
 /// | H.264 + AAC in MP4/MOV                  | File URL, played directly                    |
 /// | 8-bit H.264 in MKV/AVI, or + DTS/AC3    | HLS: video stream-copied, audio → AAC        |
-/// | HEVC, 10-bit, XviD, VP9, ...            | HLS: video → H.264 (VideoToolbox), audio → AAC |
+/// | HEVC Main/Main 10, receiver plays HEVC  | HLS (fMP4): video stream-copied, HDR kept    |
+/// | HEVC otherwise, 10-bit, XviD, VP9, ...  | HLS: video → H.264 (VideoToolbox; HDR tone-mapped), audio → AAC |
 extension TranscodeManager {
 
-    func performPreparation(from url: URL, mode: CompatibilityMode, startPosition: Double) async throws -> URL {
+    func performPreparation(from url: URL, mode: CompatibilityMode, startPosition: Double,
+                            allowHEVC: Bool) async throws -> URL {
         stopStreaming()
         let generation = preparationGeneration
 
@@ -45,8 +47,10 @@ extension TranscodeManager {
             }
             sourceDuration = duration  // Match the playlist the player will see
 
-            let (profile, plan) = try await makeStream(for: url, analysis: analysis, duration: duration,
-                                                       mode: mode, ffprobePath: ffprobePath)
+            let (profile, plan, variant) = try await makeStream(
+                for: url, analysis: analysis, duration: duration, mode: mode, allowHEVC: allowHEVC,
+                ffmpegPath: ffmpegPath, ffprobePath: ffprobePath
+            )
             try ensureCurrent(generation)
 
             statusMessage = "Starting stream..."
@@ -58,6 +62,7 @@ extension TranscodeManager {
                 sourceStartTime: analysis.startTime,
                 plan: plan,
                 profile: profile,
+                variant: variant,
                 ffmpegPath: ffmpegPath,
                 rootDirectory: CacheManager.sessionsDirectory,
                 startTime: min(max(startPosition, 0), duration)
@@ -76,6 +81,7 @@ extension TranscodeManager {
 
             activeSession = session
             sessionRegistry.register(session)
+            isHEVCPassthrough = profile.segmentFormat == .fmp4
             updateStreamingInfo(analysis: analysis, profile: profile)
             isStreaming = true
             finishPreparation(status: "Streaming")
@@ -95,54 +101,118 @@ extension TranscodeManager {
 
     // MARK: - HTTP routing
 
-    /// `GET /<session>/playlist.m3u8` and `GET /<session>/<index>.ts`
+    /// Routes, per session:
+    /// - `playlist.m3u8`: entry point (multivariant for fMP4, else the media playlist)
+    /// - `media.m3u8`: media playlist
+    /// - `init.mp4`: fMP4 init segment
+    /// - `<index>.ts` / `<index>.m4s`: segments, produced on demand
     nonisolated static func makeRequestHandler(registry: HLSSessionRegistry) -> LocalHTTPServer.Handler {
         return { request in
             let parts = request.path.split(separator: "/")
             guard parts.count == 2, let session = registry.session(id: String(parts[0])) else {
                 return .error(404)
             }
-            let name = parts[1]
+            let name = String(parts[1])
+            let playlistType = "application/vnd.apple.mpegurl"
 
-            if name == "playlist.m3u8" {
-                return .ok(Data(session.playlist.utf8), contentType: "application/vnd.apple.mpegurl")
+            switch name {
+            case "playlist.m3u8":
+                return .ok(Data(session.entryPlaylist.utf8), contentType: playlistType)
+            case HLSSession.mediaPlaylistName:
+                return .ok(Data(session.mediaPlaylist.utf8), contentType: playlistType)
+            default:
+                break
             }
 
-            guard name.hasSuffix(".ts"), let index = Int(name.dropLast(3)) else {
-                return .error(404)
-            }
-            // A HEAD must not start transcoding (it would restart FFmpeg somewhere the player isn't)
+            // Everything else may start transcoding; a HEAD must not (it would restart FFmpeg
+            // somewhere the player isn't)
             guard request.method == "GET" else {
                 return .error(405)
+            }
+
+            if name == HLSSession.initSegmentName {
+                do {
+                    return .ok(try await session.initSegment(), contentType: "video/mp4")
+                } catch {
+                    return response(for: error, what: "init segment")
+                }
+            }
+
+            let format = session.segmentFormat
+            let suffix = "." + format.urlExtension
+            guard name.hasSuffix(suffix), let index = Int(name.dropLast(suffix.count)) else {
+                return .error(404)
             }
             do {
                 let file = try await session.segment(index)
                 let data = try Data(contentsOf: file, options: .alwaysMapped)
-                return .ok(data, contentType: "video/mp2t")
-            } catch HLSSession.SessionError.notFound {
-                return .error(404)
-            } catch HLSSession.SessionError.transcodeFailed(let message) {
-                logger.error("Segment \(index) failed: \(message)")
-                return .error(500)
+                let body = format == .fmp4 ? MP4Segment.mediaSection(of: data) : data
+                return .ok(body, contentType: format.contentType)
             } catch {
-                logger.warning("Segment \(index) unavailable: \(error.localizedDescription)")
-                return .error(503)
+                return response(for: error, what: "segment \(index)")
             }
+        }
+    }
+
+    nonisolated private static func response(for error: Error, what: String) -> HTTPResponse {
+        switch error {
+        case HLSSession.SessionError.notFound:
+            return .error(404)
+        case HLSSession.SessionError.transcodeFailed(let message):
+            logger.error("\(what) failed: \(message)")
+            return .error(500)
+        default:
+            logger.warning("\(what) unavailable: \(error.localizedDescription)")
+            return .error(503)
         }
     }
 
     // MARK: - Helpers
 
-    /// Choose how to encode, and the segment layout that goes with it
+    /// Choose how to encode, the segment layout that goes with it, and (fMP4) the variant description
     private func makeStream(
         for url: URL,
         analysis: MediaAnalysis,
         duration: Double,
         mode: CompatibilityMode,
+        allowHEVC: Bool,
+        ffmpegPath: String,
         ffprobePath: String
-    ) async throws -> (StreamProfile, SegmentPlan) {
-        guard let profile = StreamProfile.make(for: analysis, mode: mode, ultraQuality: ultraQualityAudio) else {
+    ) async throws -> (StreamProfile, SegmentPlan, HLSVariant?) {
+        guard var profile = StreamProfile.make(for: analysis, mode: mode, ultraQuality: ultraQualityAudio,
+                                               allowHEVC: allowHEVC) else {
             throw TranscodeError.conversionFailed("No video stream found")
+        }
+
+        // HEVC passthrough needs the exact codec string for the multivariant playlist
+        var variant: HLSVariant?
+        if profile.segmentFormat == .fmp4 {
+            if let codec = await hevcCodecString(for: url, videoStreamIndex: profile.videoStreamIndex,
+                                                 ffmpegPath: ffmpegPath) {
+                let video = analysis.primaryVideo
+                // What's actually streamed: the copied video plus one AAC track (the file's total
+                // includes every audio track, e.g. TrueHD and other languages)
+                let videoBitRate = video?.bitRate
+                    ?? analysis.bitRate
+                    ?? Int(Double(analysis.fileSize) * 8 / max(duration, 1))
+                let average = videoBitRate + (profile.audioStreamIndex != nil ? profile.audioBitrateKbps * 1000 : 0)
+                variant = HLSVariant(
+                    codecs: [codec] + (profile.audioStreamIndex != nil ? ["mp4a.40.2"] : []),
+                    averageBandwidth: average,
+                    peakBandwidth: average * 2,  // Apple's VOD allowance: peak ≤ 200% of average
+                    width: video?.displaySize?.width,
+                    height: video?.displaySize?.height,
+                    frameRate: video?.frameRate,
+                    videoRange: analysis.videoRange
+                )
+            } else {
+                logger.warning("Couldn't read the HEVC codec configuration - re-encoding to H.264 instead")
+                guard let fallback = StreamProfile.make(for: analysis, mode: mode, ultraQuality: ultraQualityAudio,
+                                                        allowHEVC: false) else {
+                    throw TranscodeError.conversionFailed("No video stream found")
+                }
+                profile = fallback
+            }
         }
 
         if profile.video == .copy {
@@ -158,8 +228,8 @@ extension TranscodeManager {
                 if let plan = SegmentPlan.keyframeAligned(keyframes: keyframes, duration: duration,
                                                           targetLength: StreamProfile.segmentLength),
                    plan.longestSegment <= StreamProfile.maxCopySegmentLength {
-                    logger.info("📦 Stream copy: \(plan.count) segments from \(keyframes.count) keyframes")
-                    return (profile, plan)
+                    logger.info("📦 Stream copy (\(profile.segmentFormat == .fmp4 ? "HEVC fMP4" : "MPEG-TS")): \(plan.count) segments from \(keyframes.count) keyframes")
+                    return (profile, plan, variant)
                 }
                 // Keyframes too sparse: huge segments mean slow starts and seeks
                 logger.warning("Keyframes unusable for segmenting (\(keyframes.count) found) - re-encoding instead")
@@ -169,12 +239,27 @@ extension TranscodeManager {
         }
 
         guard let encodeProfile = StreamProfile.make(for: analysis, mode: mode, ultraQuality: ultraQualityAudio,
-                                                     forceEncode: true),
+                                                     allowHEVC: false, forceEncode: true),
               let plan = SegmentPlan.uniform(duration: duration, segmentLength: StreamProfile.segmentLength) else {
             throw TranscodeError.conversionFailed("Invalid duration")
         }
         logger.info("🎬 Transcode: \(plan.count) segments")
-        return (encodeProfile, plan)
+        return (encodeProfile, plan, nil)
+    }
+
+    /// RFC 6381 codec string of the source's HEVC stream, read from the `hvcC` box FFmpeg writes when
+    /// it copies the stream into MP4 (the same box the segments' init will carry). ~50ms.
+    private func hevcCodecString(for url: URL, videoStreamIndex: Int, ffmpegPath: String) async -> String? {
+        let output = try? await ProcessRunner.output(of: ffmpegPath, arguments: [
+            "-hide_banner", "-nostdin", "-loglevel", "error",
+            "-i", url.path,
+            "-map", "0:\(videoStreamIndex)",
+            "-c:v", "copy", "-tag:v", "hvc1",
+            "-frames:v", "1",
+            "-f", "mp4", "-movflags", "+frag_keyframe+empty_moov",
+            "-"
+        ])
+        return output.flatMap(MP4Segment.hevcCodecString)
     }
 
     private func ensureCurrent(_ generation: Int) throws {
@@ -203,7 +288,11 @@ extension TranscodeManager {
         }
 
         if let profile {
-            outputVideoCodec = "H.264"
+            if profile.segmentFormat == .fmp4 {
+                outputVideoCodec = analysis.videoRange == .sdr ? "HEVC" : "HEVC \(analysis.videoRange == .pq ? "HDR10" : "HLG")"
+            } else {
+                outputVideoCodec = "H.264"
+            }
             outputAudioCodec = "AAC"
             outputAudioChannels = profile.audioChannels >= 6 ? "5.1" : "Stereo"
         } else {

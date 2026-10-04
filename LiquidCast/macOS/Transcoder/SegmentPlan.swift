@@ -72,14 +72,16 @@ struct SegmentPlan: Equatable {
 
     // MARK: - Playlist
 
-    /// Complete VOD playlist. Segment URIs are `<index>.ts`, relative to the playlist URL.
-    /// - Parameter startTime: Where playback should begin (resume position), via EXT-X-START.
-    func playlist(startTime: Double = 0) -> String {
-        let longest = longestSegment
+    /// Complete VOD media playlist. Segment URIs are `<index>.<segmentExtension>`, relative to the
+    /// playlist URL.
+    /// - Parameters:
+    ///   - startTime: Where playback should begin (resume position), via EXT-X-START
+    ///   - initURI: fMP4 only: the init segment (EXT-X-MAP)
+    func playlist(startTime: Double = 0, segmentExtension: String = "ts", initURI: String? = nil) -> String {
         var lines = [
             "#EXTM3U",
-            "#EXT-X-VERSION:6",
-            "#EXT-X-TARGETDURATION:\(Int(longest.rounded(.up)))",
+            "#EXT-X-VERSION:\(initURI == nil ? 6 : 7)",
+            "#EXT-X-TARGETDURATION:\(Int(longestSegment.rounded(.up)))",
             "#EXT-X-MEDIA-SEQUENCE:0",
             "#EXT-X-PLAYLIST-TYPE:VOD",
             "#EXT-X-INDEPENDENT-SEGMENTS",
@@ -87,11 +89,43 @@ struct SegmentPlan: Equatable {
         if startTime > 0 {
             lines.append(String(format: "#EXT-X-START:TIME-OFFSET=%.3f,PRECISE=YES", min(startTime, duration)))
         }
+        if let initURI {
+            lines.append("#EXT-X-MAP:URI=\"\(initURI)\"")
+        }
         for index in 0..<count {
             lines.append(String(format: "#EXTINF:%.6f,", duration(of: index)))
-            lines.append("\(index).ts")
+            lines.append("\(index).\(segmentExtension)")
         }
         lines.append("#EXT-X-ENDLIST")
         return lines.joined(separator: "\n") + "\n"
+    }
+}
+
+/// The one variant of a stream, described in a multivariant ("master") playlist. Needed for HEVC/HDR:
+/// receivers learn the codec and dynamic range from it (CODECS, VIDEO-RANGE) before downloading.
+struct HLSVariant {
+    var codecs: [String]
+    var averageBandwidth: Int
+    var peakBandwidth: Int
+    var width: Int?
+    var height: Int?
+    var frameRate: Double?
+    var videoRange: VideoRange
+
+    /// - Parameter mediaURI: The media playlist, relative to the master playlist
+    func masterPlaylist(mediaURI: String) -> String {
+        var attributes = [
+            "BANDWIDTH=\(peakBandwidth)",
+            "AVERAGE-BANDWIDTH=\(averageBandwidth)",
+            "CODECS=\"\(codecs.joined(separator: ","))\"",
+        ]
+        if let width, let height {
+            attributes.append("RESOLUTION=\(width)x\(height)")
+        }
+        // AVFoundation rejects an HEVC PQ variant without FRAME-RATE ("unsupported URL"). Verified on macOS 26.
+        attributes.append(String(format: "FRAME-RATE=%.3f", frameRate ?? 24))
+        attributes.append("VIDEO-RANGE=\(videoRange.rawValue)")
+        return ["#EXTM3U", "#EXT-X-VERSION:7", "#EXT-X-INDEPENDENT-SEGMENTS",
+                "#EXT-X-STREAM-INF:" + attributes.joined(separator: ","), mediaURI].joined(separator: "\n") + "\n"
     }
 }

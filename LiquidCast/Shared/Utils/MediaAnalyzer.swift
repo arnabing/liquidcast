@@ -17,6 +17,29 @@ struct StreamInfo {
     /// Stream start (seconds, container timestamps) and length, if the container says
     let startTime: Double?
     let duration: Double?
+    /// Video: transfer characteristic ("smpte2084" = PQ, "arib-std-b67" = HLG, "bt709", ...)
+    var colorTransfer: String? = nil
+    /// Video: frames per second (average)
+    var frameRate: Double? = nil
+    /// Video: Dolby Vision profile, if the stream carries Dolby Vision
+    var dolbyVisionProfile: Int? = nil
+    /// Video: display rotation in degrees (phone videos are often stored landscape, rotated ±90)
+    var rotation: Int = 0
+    /// Bits/s, if the container says (Matroska: the `BPS` tag)
+    var bitRate: Int? = nil
+
+    /// Size as displayed (width/height swapped for ±90° rotation)
+    var displaySize: (width: Int, height: Int)? {
+        guard let width, let height else { return nil }
+        return abs(rotation) % 180 == 90 ? (height, width) : (width, height)
+    }
+}
+
+/// Dynamic range of a video stream, as HLS `VIDEO-RANGE` names it
+enum VideoRange: String {
+    case sdr = "SDR"
+    case pq = "PQ"
+    case hlg = "HLG"
 }
 
 /// Conversion path ordered by speed (lower = faster)
@@ -49,6 +72,8 @@ struct MediaAnalysis {
     let fileSize: Int64
     let videoStreams: [StreamInfo]
     let audioStreams: [StreamInfo]
+    /// Average bitrate of the whole file (bits/s), if known
+    var bitRate: Int? = nil
 
     /// Primary video stream (first one)
     var primaryVideo: StreamInfo? { videoStreams.first }
@@ -68,6 +93,25 @@ struct MediaAnalysis {
         let pixelFormatOK = ["yuv420p", "yuvj420p"].contains(video.pixelFormat ?? "yuv420p")
         let profileOK = ["baseline", "constrained baseline", "main", "high"].contains((video.profile ?? "high").lowercased())
         return pixelFormatOK && profileOK
+    }
+
+    var videoRange: VideoRange {
+        switch primaryVideo?.colorTransfer {
+        case "smpte2084": return .pq
+        case "arib-std-b67": return .hlg
+        default: return .sdr
+        }
+    }
+
+    /// HEVC that Apple TV 4K plays as-is: Main or Main 10, 4:2:0, SDR/HDR10/HLG. Dolby Vision only
+    /// when it has an HDR10/SDR-compatible base layer (profiles 7 and 8), which plays once the DV
+    /// data is stripped; profile 5's base layer isn't watchable on its own.
+    var isPassthroughHEVC: Bool {
+        guard isHEVCVideo, let video = primaryVideo else { return false }
+        let pixelFormatOK = ["yuv420p", "yuv420p10le"].contains(video.pixelFormat ?? "")
+        let profileOK = ["main", "main 10"].contains((video.profile ?? "").lowercased())
+        let dolbyVisionOK = video.dolbyVisionProfile.map { [7, 8].contains($0) } ?? true
+        return pixelFormatOK && profileOK && dolbyVisionOK
     }
 
     /// End of the video stream in media time (seconds from the container start). Audio often runs
@@ -110,7 +154,8 @@ struct MediaAnalysis {
             return .directPlayback
         }
 
-        // H.265 over AirPlay is unreliable - always transcode
+        // HEVC: re-encoded to H.264 here; HEVC passthrough (receiver permitting) is decided in
+        // StreamProfile.make, which needs to know the receiver
         if isHEVCVideo {
             return .videoTranscode
         }
@@ -198,6 +243,15 @@ enum MediaAnalyzer {
 
     // MARK: - Private
 
+    /// "24000/1001" → 23.976 (nil for "0/0")
+    static func parseRate(_ text: String) -> Double? {
+        let parts = text.split(separator: "/")
+        guard parts.count == 2, let num = Double(parts[0]), let den = Double(parts[1]), den > 0, num > 0 else {
+            return nil
+        }
+        return num / den
+    }
+
     /// Matroska stores per-stream length as a tag, e.g. "01:52:03.125000000"
     static func parseClockDuration(_ text: String) -> Double? {
         let parts = text.split(separator: ":")
@@ -244,7 +298,16 @@ enum MediaAnalyzer {
                 sampleRate: (stream["sample_rate"] as? String).flatMap { Int($0) },
                 startTime: (stream["start_time"] as? String).flatMap { Double($0) },
                 duration: (stream["duration"] as? String).flatMap { Double($0) }
-                    ?? ((stream["tags"] as? [String: Any])?["DURATION"] as? String).flatMap(parseClockDuration)
+                    ?? ((stream["tags"] as? [String: Any])?["DURATION"] as? String).flatMap(parseClockDuration),
+                colorTransfer: stream["color_transfer"] as? String,
+                frameRate: (stream["avg_frame_rate"] as? String).flatMap(parseRate)
+                    ?? (stream["r_frame_rate"] as? String).flatMap(parseRate),
+                dolbyVisionProfile: (stream["side_data_list"] as? [[String: Any]])?
+                    .first { ($0["side_data_type"] as? String)?.contains("DOVI") == true }?["dv_profile"] as? Int,
+                rotation: ((stream["side_data_list"] as? [[String: Any]])?
+                    .first { $0["side_data_type"] as? String == "Display Matrix" }?["rotation"] as? Int) ?? 0,
+                bitRate: (stream["bit_rate"] as? String).flatMap { Int($0) }
+                    ?? ((stream["tags"] as? [String: Any])?["BPS"] as? String).flatMap { Int($0) }
             )
 
             switch codecType {
@@ -260,7 +323,8 @@ enum MediaAnalyzer {
             startTime: startTime,
             fileSize: fileSize,
             videoStreams: videoStreams,
-            audioStreams: audioStreams
+            audioStreams: audioStreams,
+            bitRate: (format["bit_rate"] as? String).flatMap { Int($0) }
         )
     }
 }

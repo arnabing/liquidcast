@@ -83,8 +83,10 @@ enum CompatibilityMode: String, CaseIterable, Codable {
             }
         }
 
-        // Unknown device - default to Smart TV with H.264 for max compatibility
-        return (.smartTV, false)
+        // Anything else is most likely an Apple TV: tvOS names it after its room ("Living Room"),
+        // while AirPlay smart TVs advertise their brand. If it can't play HEVC after all, playback
+        // falls back to H.264 for that device (AppState.handlePlaybackFailure).
+        return (.appleTV, true)
     }
 }
 
@@ -133,6 +135,8 @@ class AppState: ObservableObject {
 
     private var seekDebounceTask: Task<Void, Never>? = nil
     private var seekCount = 0
+    /// Where the current load started playing (resume position)
+    private var loadStartPosition: Double = 0
 
     /// Formatted streaming info for display
     var streamingInfoText: String {
@@ -268,6 +272,12 @@ class AppState: ObservableObject {
             }
         }
 
+        mediaPlayer.onItemFailed = { [weak self] error in
+            Task { @MainActor in
+                self?.handlePlaybackFailure(error)
+            }
+        }
+
         mediaPlayer.onBufferingChanged = { [weak self] isBuffering in
             Task { @MainActor in
                 self?.isBuffering = isBuffering
@@ -351,7 +361,10 @@ class AppState: ObservableObject {
 
     // MARK: - Actions
 
-    func loadMedia(from url: URL) {
+    /// - Parameters:
+    ///   - resumeAt: Start here instead of the saved position
+    ///   - forceH264: Don't pass HEVC through, even if the receiver is believed to support it
+    func loadMedia(from url: URL, resumeAt: Double? = nil, forceH264: Bool = false) {
         appStateLogger.info("🎬 Loading media: \(url.lastPathComponent)")
 
         // Cancel any previous load operation (also kills its FFmpeg and deletes its segments), and
@@ -373,7 +386,9 @@ class AppState: ObservableObject {
         clearStreamingInfo()
 
         // Check for saved playback position to resume from
-        let savedPosition = CacheManager.getPlaybackPosition(for: url) ?? 0
+        let savedPosition = resumeAt ?? CacheManager.getPlaybackPosition(for: url) ?? 0
+        loadStartPosition = savedPosition
+        let allowHEVC = !forceH264 && receiverSupportsHEVC
 
         if savedPosition > 0 {
             appStateLogger.info("📍 Found saved position: \(Int(savedPosition))s for \(url.lastPathComponent)")
@@ -386,7 +401,8 @@ class AppState: ObservableObject {
                 let playableURL = try await transcodeManager.prepareForAirPlay(
                     from: url,
                     mode: compatibilityMode,
-                    startPosition: savedPosition
+                    startPosition: savedPosition,
+                    allowHEVC: allowHEVC
                 )
 
                 // Check if this load was superseded by a newer one
@@ -407,6 +423,64 @@ class AppState: ObservableObject {
                 conversionError = error.localizedDescription
             }
         }
+    }
+
+    // MARK: - HEVC passthrough
+
+    /// Receivers that failed to play HEVC passthrough; they get H.264 from then on
+    private let hevcUnsupportedDevicesKey = "hevcUnsupportedDevices"
+
+    /// Apple TV mode means an Apple TV, which decodes HEVC/HDR - unless it's an older model that
+    /// already failed (Apple TV HD), which `handlePlaybackFailure()` records
+    private var receiverSupportsHEVC: Bool {
+        guard compatibilityMode == .appleTV else { return false }
+        let unsupported = UserDefaults.standard.stringArray(forKey: hevcUnsupportedDevicesKey) ?? []
+        return !unsupported.contains(currentAirPlayDevice ?? "")
+    }
+
+    /// The player gave up on the current item. If that's an HEVC passthrough stream, continue with
+    /// H.264 from the same position. Only a decode/format error on a receiver marks that receiver as
+    /// unable to play HEVC: network drops, sleep and server errors fail items too.
+    private func handlePlaybackFailure(_ error: Error?) {
+        guard transcodeManager.isHEVCPassthrough, let url = selectedMediaURL else { return }
+        // A receiver that can't decode fails before any progress: resume where this load started
+        let position = playbackProgress > 0 ? playbackProgress : loadStartPosition
+        let onReceiver = mediaPlayer.isExternalPlaybackActive || isConnectedToAirPlay
+
+        if onReceiver, Self.isDecodeFailure(error), let device = currentAirPlayDevice {
+            var unsupported = UserDefaults.standard.stringArray(forKey: hevcUnsupportedDevicesKey) ?? []
+            if !unsupported.contains(device) {
+                unsupported.append(device)
+                UserDefaults.standard.set(unsupported, forKey: hevcUnsupportedDevicesKey)
+            }
+            appStateLogger.warning("⚠️ '\(device)' can't play HEVC - using H.264 for it from now on")
+        }
+        appStateLogger.warning("⚠️ HEVC playback failed (\(error?.localizedDescription ?? "unknown error")) - continuing with H.264 at \(Int(position))s")
+        loadMedia(from: url, resumeAt: position, forceH264: true)
+    }
+
+    /// Errors meaning "can't decode/understand this media", as opposed to network or server trouble
+    private static func isDecodeFailure(_ error: Error?) -> Bool {
+        let decodeErrors: [String: Set<Int>] = [
+            AVFoundationErrorDomain: [
+                AVError.decodeFailed.rawValue,               // -11821
+                AVError.fileFormatNotRecognized.rawValue,    // -11828
+                AVError.failedToParse.rawValue,              // -11829
+                AVError.decoderNotFound.rawValue,            // -11833
+            ],
+            "CoreMediaErrorDomain": [-12927],                // Format/codec not supported by the player
+        ]
+        var current = error as NSError?
+        while let nsError = current {
+            if decodeErrors[nsError.domain]?.contains(nsError.code) == true { return true }
+            current = nsError.userInfo[NSUnderlyingErrorKey] as? NSError
+        }
+        return false
+    }
+
+    /// Forget which receivers failed HEVC (e.g. after the user swaps an Apple TV HD for a 4K)
+    func resetHEVCUnsupportedDevices() {
+        UserDefaults.standard.removeObject(forKey: hevcUnsupportedDevicesKey)
     }
 
     /// Cancel any ongoing conversion

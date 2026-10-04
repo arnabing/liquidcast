@@ -81,6 +81,13 @@ struct MiniPlayerView: View {
 struct NowPlayingBar: View {
     @EnvironmentObject var appState: AppState
 
+    static func formatTime(_ seconds: Double) -> String {
+        let total = Int(max(seconds, 0))
+        return total >= 3600
+            ? String(format: "%d:%02d:%02d", total / 3600, (total % 3600) / 60, total % 60)
+            : String(format: "%d:%02d", total / 60, total % 60)
+    }
+
     var body: some View {
         HStack(spacing: 10) {
             // Status indicator dot
@@ -125,6 +132,21 @@ struct NowPlayingBar: View {
                             Text(appState.conversionStatus)
                                 .font(.system(size: 10, weight: .medium))
                                 .foregroundColor(appState.isConverting ? .orange : .cyan)
+                        }
+
+                        // Resumed from a saved position: offer a clean restart from 0:00
+                        if let resumed = appState.resumedFrom {
+                            Text("·")
+                                .foregroundColor(.secondary)
+                            Button {
+                                appState.startOver()
+                            } label: {
+                                Text("Resumed at \(Self.formatTime(resumed)) · Start Over")
+                                    .font(.system(size: 10, weight: .medium))
+                                    .foregroundColor(.blue)
+                            }
+                            .buttonStyle(.plain)
+                            .help("Play from the beginning")
                         }
                     }
                 } else if !appState.airPlayManager.isAirPlayAvailable {

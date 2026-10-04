@@ -24,9 +24,16 @@ file ─► MediaAnalyzer (ffprobe)
 |---|---|---|
 | 8-bit 4:2:0 H.264 (Baseline/Main/High) in MKV/AVI/TS, or with DTS/AC3/... | stream copy (MPEG-TS) | see below |
 | HEVC Main/Main 10 (SDR, HDR10, HLG, Dolby Vision 7/8), Apple TV receiver | stream copy (fMP4), HDR kept | see below |
-| anything else — or copy would give segments over 10s | H.264 (`h264_videotoolbox`, MPEG-TS); HDR tone-mapped to SDR | see below |
+| anything else — or copy would give segments over 30s | H.264 (`h264_videotoolbox`, MPEG-TS); HDR tone-mapped to SDR | see below |
 
-Audio: AC-3 and E-AC-3 (including Dolby Atmos) are copied untouched for an Apple TV receiver.
+Stream-copied video is cut at the source keyframe that makes each segment closest to 6s (at least 2s).
+"First keyframe past 6s" skipped keyframes just short of it: with x265's default ~10s keyframe interval
+that made 16s segments, and the old 10s limit then re-encoded the whole movie. Long segments only cost
+seek granularity and the first download, so only pathological sources (>30s) are re-encoded.
+
+Audio: AC-3 and E-AC-3 (including Dolby Atmos) are copied untouched for an Apple TV receiver. AAC-LC
+that already has the output layout (≤48kHz) is copied for every receiver: re-encoding it only loses
+quality.
 Everything else becomes AAC in mono, stereo or 5.1 (never upmixed; 5.1 is kept for an Apple TV, which
 downmixes for its own output, and with Ultra; smart TVs otherwise get stereo; 192/384 kbps for
 stereo/5.1, 320/512 with Ultra), resampled to

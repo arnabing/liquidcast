@@ -134,6 +134,8 @@ class AppState: ObservableObject {
 
     @Published var isSeeking: Bool = false              // True during seek operation
     @Published var isBuffering: Bool = false            // Player is waiting for data
+    /// Saved position the current file resumed from (nil: started from the beginning)
+    @Published var resumedFrom: Double?
 
     // MARK: - Subtitles
 
@@ -301,6 +303,9 @@ class AppState: ObservableObject {
         mediaPlayer.onPlaybackStateChanged = { [weak self] isPlaying in
             Task { @MainActor in
                 self?.isPlaying = isPlaying
+                // Playing again means any seek finished, even if the receiver didn't report completion
+                // (over AirPlay the Apple TV may carry out a seek without the completion firing)
+                if isPlaying, self?.isSeeking == true { self?.seekCompleted() }
             }
         }
 
@@ -453,6 +458,7 @@ class AppState: ObservableObject {
         // Check for saved playback position to resume from
         let savedPosition = resumeAt ?? CacheManager.getPlaybackPosition(for: url) ?? 0
         loadStartPosition = savedPosition
+        resumedFrom = savedPosition > 0 ? savedPosition : nil
         loadExcludedPassthrough = excludingPassthrough
         loadBurnIn = burnIn
         subtitleChoice = .off
@@ -536,6 +542,16 @@ class AppState: ObservableObject {
             mediaPlayer.selectSubtitle(at: nil)
             if wasBurnedIn != stream { reloadCurrent(burnIn: .stream(stream), subtitles: .off) }
         }
+    }
+
+    /// Play the current file from the beginning: forget the saved position and reload with no start
+    /// offset, so the receiver can't land anywhere but 0:00
+    func startOver() {
+        guard let url = selectedMediaURL else { return }
+        CacheManager.clearPlaybackPosition(for: url)
+        appStateLogger.info("⏮️ Starting over: \(url.lastPathComponent)")
+        loadMedia(from: url, resumeAt: 0, excludingPassthrough: loadExcludedPassthrough,
+                  burnIn: loadBurnIn, subtitles: currentSubtitleSelection)
     }
 
     /// Prepare the current file again (different burn-in) and continue from the current position

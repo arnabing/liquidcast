@@ -64,8 +64,9 @@ struct StreamProfile {
     var segmentFormat: SegmentFormat = .mpegts
     /// Remove Dolby Vision metadata, leaving the HDR10-compatible base layer (DV profiles 7 and 8)
     var stripDolbyVision = false
-    /// Audio passed through untouched ("ac3"/"eac3", incl. Atmos in E-AC-3) instead of AAC. Copied
-    /// audio also lines up exactly across restarts: same source frames, no encoder priming.
+    /// Audio passed through untouched instead of re-encoded: "ac3"/"eac3" (incl. Atmos, Apple TV only)
+    /// or "aac" that already has the output layout. Copied audio also lines up exactly across restarts:
+    /// same source frames, no encoder priming.
     var copiedAudioCodec: String? = nil
     /// Bitmap subtitle stream (PGS/VobSub/DVB) to burn into the video; requires re-encoding
     var burnInSubtitleIndex: Int? = nil
@@ -82,8 +83,10 @@ struct StreamProfile {
     static let boundaryEpsilon: Double = 0.0001234
     /// Re-encoded segment length (Apple's HLS recommendation)
     static let segmentLength: Double = 6
-    /// Stream copy only if no segment would be longer (sparse source keyframes → slow starts/seeks)
-    static let maxCopySegmentLength: Double = 10
+    /// Stream copy unless a segment would be longer than this. Longer segments only cost seek
+    /// granularity and the size of the first download; this rejects pathological sources (minutes
+    /// between keyframes), not ordinary x265 encodes (~10s keyframe interval)
+    static let maxCopySegmentLength: Double = 30
 
     /// Preferred input seek position for a job starting at `startIndex` (the session moves it
     /// earlier if the demuxer would land at or after the boundary)
@@ -314,7 +317,7 @@ extension StreamProfile {
         }
 
         let audio = analysis.audioStream(preferDolby: passthrough.contains(.dolbyAudio))
-        let copyAudio = passthrough.contains(.dolbyAudio) && audio?.isDolbyAudio == true
+        let copyDolby = passthrough.contains(.dolbyAudio) && audio?.isDolbyAudio == true
 
         // Standard layouts only: mono, stereo, 5.1 (never upmixed). Surround is kept for an Apple TV, which
         // downmixes to whatever its output is, and with Ultra; smart TVs otherwise get stereo.
@@ -327,6 +330,11 @@ extension StreamProfile {
         }
         // Apple's HLS spec: AAC at 48kHz or below
         let sampleRate = audio?.sampleRate.flatMap { $0 > 48_000 ? 48_000 : nil }
+        // AAC-LC that already has the output layout plays everywhere: re-encoding would only lose quality
+        let copyAAC = audio.map {
+            $0.codecName.lowercased() == "aac" && ($0.profile ?? "LC") == "LC"
+                && ($0.sampleRate ?? 48_000) <= 48_000 && $0.channels == channels
+        } ?? false
 
         return StreamProfile(
             videoStreamIndex: video.index,
@@ -338,7 +346,7 @@ extension StreamProfile {
             audioSampleRate: sampleRate,
             segmentFormat: segmentFormat,
             stripDolbyVision: segmentFormat == .fmp4 && video.dolbyVisionProfile != nil,
-            copiedAudioCodec: copyAudio ? audio?.codecName.lowercased() : nil,
+            copiedAudioCodec: copyDolby || copyAAC ? audio?.codecName.lowercased() : nil,
             burnInSubtitleIndex: burnInSubtitle,
             toneMapSize: toneMapSize
         )

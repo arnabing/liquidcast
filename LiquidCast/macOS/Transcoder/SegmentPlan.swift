@@ -53,19 +53,41 @@ struct SegmentPlan: Equatable {
     }
 
     /// Segments cut at source keyframes, for stream-copied video (cuts can only happen on keyframes).
-    /// A new segment starts at the first keyframe at least `targetLength` after the previous cut.
+    /// Each cut goes to the keyframe that makes the segment closest to `targetLength` (at least
+    /// `minimumLength`), so segments stay near the keyframe spacing. "First keyframe at or past the
+    /// target" would skip a keyframe just short of it: with x265's ~10s keyframe interval that makes
+    /// 16s segments.
     /// - Parameter keyframes: Keyframe times in media time, any order.
-    static func keyframeAligned(keyframes: [Double], duration: Double, targetLength: Double) -> SegmentPlan? {
+    static func keyframeAligned(keyframes: [Double], duration: Double, targetLength: Double,
+                                minimumLength: Double = 2) -> SegmentPlan? {
         guard duration > 0, targetLength > 0 else { return nil }
-        let sorted = keyframes.filter { $0 >= 0 && $0 < duration }.sorted()
+        let sorted = keyframes.filter { $0 >= 0 && $0 < duration - 0.5 }.sorted()
         // Copy must start on a keyframe; require one at (or within a frame of) the start
         guard let first = sorted.first, first < 0.1 else { return nil }
 
         var boundaries: [Double] = [0]
         var last = 0.0
-        for key in sorted where key >= last + targetLength && key < duration - 0.5 {
-            boundaries.append(key)
-            last = key
+        var index = 0
+        while true {
+            // Last keyframe within the target, and first one at or past it
+            while index < sorted.count && sorted[index] <= last { index += 1 }
+            var before: Double?
+            var probe = index
+            while probe < sorted.count && sorted[probe] - last < targetLength {
+                if sorted[probe] - last >= minimumLength { before = sorted[probe] }
+                probe += 1
+            }
+            let after = probe < sorted.count ? sorted[probe] : nil
+            let cut: Double?
+            switch (before, after) {
+            case let (b?, a?): cut = (targetLength - (b - last)) <= ((a - last) - targetLength) ? b : a
+            case let (b?, nil): cut = duration - b >= minimumLength ? b : nil  // Don't leave a sliver at the end
+            case let (nil, a?): cut = a
+            case (nil, nil): cut = nil
+            }
+            guard let cut else { break }
+            boundaries.append(cut)
+            last = cut
         }
         return SegmentPlan(boundaries: boundaries, duration: duration)
     }

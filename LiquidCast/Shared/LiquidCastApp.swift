@@ -86,6 +86,11 @@ struct MenuBarContentView: View {
         .keyboardShortcut(.leftArrow, modifiers: [])
         .disabled(appState.selectedMediaURL == nil)
 
+        Button("Start Over") {
+            appState.startOver()
+        }
+        .disabled(appState.selectedMediaURL == nil)
+
         Button("Skip Forward 30s") {
             appState.seek(to: min(appState.playbackProgress + 30, appState.duration))
         }

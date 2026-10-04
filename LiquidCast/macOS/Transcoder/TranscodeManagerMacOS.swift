@@ -105,7 +105,7 @@ extension TranscodeManager {
             burnedInSubtitle = profile.burnInSubtitleIndex
             passthroughUsed = []
             if profile.segmentFormat == .fmp4 { passthroughUsed.insert(.hevc) }
-            if profile.copiedAudioCodec != nil { passthroughUsed.insert(.dolbyAudio) }
+            if ["ac3", "eac3"].contains(profile.copiedAudioCodec ?? "") { passthroughUsed.insert(.dolbyAudio) }
             updateStreamingInfo(analysis: analysis, profile: profile)
             isStreaming = true
             finishPreparation(status: "Streaming")
@@ -307,7 +307,9 @@ extension TranscodeManager {
         if profile.audioStreamIndex == nil {
             audioBitRate = 0
         } else if profile.copiedAudioCodec != nil {
-            audioBitRate = streamedAudio?.bitRate ?? 768_000  // Atmos E-AC-3 is usually 768 kbps
+            // Unknown: assume generous typical rates (Atmos E-AC-3 768 kbps; AAC ~96 kbps per channel)
+            audioBitRate = streamedAudio?.bitRate
+                ?? (profile.copiedAudioCodec == "aac" ? 96_000 * max(streamedAudio?.channels ?? 2, 1) : 768_000)
         } else {
             audioBitRate = profile.audioBitrateKbps * 1000
         }

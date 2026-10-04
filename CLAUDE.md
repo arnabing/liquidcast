@@ -30,6 +30,7 @@ LiquidCast is a macOS app for casting any video format to Apple TV via AirPlay. 
 - Orchestrates: MediaPlayerController, AirPlayManager, TranscodeManager
 - Persists: device name, compatibility mode, ultra quality setting
 - Saves playback position every 5s and resumes from it (cleared past 95%); seeks go straight to AVPlayer
+- `startOver()`: forget the saved position and reload from 0:00 ("Start Over" in the player and menu); a resumed file's start offset is in the playlist (EXT-X-START), so a receiver loading it lands there
 - Subtitle menu (text renditions via media selection; bitmap tracks via burn-in reload), follows network address changes (`NWPathMonitor`), stall check for passthrough
 
 **TranscodeManager** (`Shared/Transcoder/TranscodeManager.swift` + `macOS/Transcoder/TranscodeManagerMacOS.swift`)

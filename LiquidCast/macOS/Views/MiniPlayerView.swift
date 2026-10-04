@@ -194,12 +194,6 @@ struct PlaybackProgressBar: View {
         appState.sourceDuration > 0 ? appState.sourceDuration : appState.duration
     }
 
-    /// Whether transcoding is still in progress (not yet complete)
-    private var isTranscodingInProgress: Bool {
-        // Transcoding is in progress if we're streaming AND duration < sourceDuration
-        appState.isStreaming && appState.sourceDuration > 0 && appState.duration < appState.sourceDuration * 0.99
-    }
-
     /// Display position: preview during drag/seek, actual during playback
     private var displayPosition: Double {
         if isDragging {
@@ -219,13 +213,6 @@ struct PlaybackProgressBar: View {
                     RoundedRectangle(cornerRadius: 2)
                         .fill(Color.gray.opacity(0.3))
                         .frame(height: isHovering || isDragging ? 5 : 3)
-
-                    // Buffered/transcoded portion (light gray)
-                    if isTranscodingInProgress {
-                        RoundedRectangle(cornerRadius: 2)
-                            .fill(Color.gray.opacity(0.5))
-                            .frame(width: bufferedWidth(in: geometry), height: isHovering || isDragging ? 5 : 3)
-                    }
 
                     // Progress bar (red - YouTube style) - uses displayPosition for real-time feedback
                     RoundedRectangle(cornerRadius: 2)
@@ -277,8 +264,8 @@ struct PlaybackProgressBar: View {
                 // Show preview time during drag, otherwise playback time
                 Text(formatTime(displayPosition))
                 Spacer()
-                // Show spinner while transcoding is still in progress OR while seeking
-                if isTranscodingInProgress || appState.isSeeking {
+                // Show spinner while waiting for video data or seeking
+                if appState.isBuffering || appState.isSeeking {
                     ProgressView()
                         .scaleEffect(0.5)
                         .frame(width: 12, height: 12)
@@ -288,13 +275,6 @@ struct PlaybackProgressBar: View {
             .font(.system(size: 11, weight: .medium, design: .monospaced))
             .foregroundColor(.secondary)
         }
-    }
-
-    /// Width of the buffered/transcoded portion (relative to source duration)
-    private func bufferedWidth(in geometry: GeometryProxy) -> CGFloat {
-        guard displayDuration > 0 else { return geometry.size.width }
-        let ratio = min(appState.duration / displayDuration, 1.0)
-        return geometry.size.width * CGFloat(ratio)
     }
 
     /// Width for a specific position (relative to source duration)

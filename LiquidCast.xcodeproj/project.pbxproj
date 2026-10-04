@@ -43,7 +43,10 @@
 		A1300001001 /* TranscodeManagerMacOS.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1300001000 /* TranscodeManagerMacOS.swift */; };
 		A1300002001 /* TranscodeManageriOS.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1300002000 /* TranscodeManageriOS.swift */; };
 		A1400001001 /* FFmpegProcess.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1400001000 /* FFmpegProcess.swift */; };
-		A1400002001 /* HLSSegmentMonitor.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1400002000 /* HLSSegmentMonitor.swift */; };
+		A1400002001 /* HLSSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1400002000 /* HLSSession.swift */; };
+		A1400010001 /* SegmentPlan.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1400010000 /* SegmentPlan.swift */; };
+		A1400020001 /* StreamProfile.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1400020000 /* StreamProfile.swift */; };
+		A1400030001 /* KeyframeIndex.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1400030000 /* KeyframeIndex.swift */; };
 		A1400003001 /* MediaAnalyzer.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1400003000 /* MediaAnalyzer.swift */; };
 		A1400004001 /* MediaAnalyzer.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1400003000 /* MediaAnalyzer.swift */; };
 		A1500001001 /* MiniPlayerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1500001000 /* MiniPlayerView.swift */; };
@@ -75,7 +78,10 @@
 		A1300001000 /* TranscodeManagerMacOS.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TranscodeManagerMacOS.swift; sourceTree = "<group>"; };
 		A1300002000 /* TranscodeManageriOS.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TranscodeManageriOS.swift; sourceTree = "<group>"; };
 		A1400001000 /* FFmpegProcess.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FFmpegProcess.swift; sourceTree = "<group>"; };
-		A1400002000 /* HLSSegmentMonitor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HLSSegmentMonitor.swift; sourceTree = "<group>"; };
+		A1400002000 /* HLSSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HLSSession.swift; sourceTree = "<group>"; };
+		A1400010000 /* SegmentPlan.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SegmentPlan.swift; sourceTree = "<group>"; };
+		A1400020000 /* StreamProfile.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamProfile.swift; sourceTree = "<group>"; };
+		A1400030000 /* KeyframeIndex.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeyframeIndex.swift; sourceTree = "<group>"; };
 		A1400003000 /* MediaAnalyzer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaAnalyzer.swift; sourceTree = "<group>"; };
 		A1500001000 /* MiniPlayerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MiniPlayerView.swift; sourceTree = "<group>"; };
 		A2000001000 /* LiquidCast.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = LiquidCast.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -275,7 +281,10 @@
 			children = (
 				A1300001000 /* TranscodeManagerMacOS.swift */,
 				A1400001000 /* FFmpegProcess.swift */,
-				A1400002000 /* HLSSegmentMonitor.swift */,
+				A1400002000 /* HLSSession.swift */,
+				A1400010000 /* SegmentPlan.swift */,
+				A1400020000 /* StreamProfile.swift */,
+				A1400030000 /* KeyframeIndex.swift */,
 			);
 			path = Transcoder;
 			sourceTree = "<group>";
@@ -434,7 +443,10 @@
 				A1500001001 /* MiniPlayerView.swift in Sources */,
 				A1300001001 /* TranscodeManagerMacOS.swift in Sources */,
 				A1400001001 /* FFmpegProcess.swift in Sources */,
-				A1400002001 /* HLSSegmentMonitor.swift in Sources */,
+				A1400002001 /* HLSSession.swift in Sources */,
+				A1400010001 /* SegmentPlan.swift in Sources */,
+				A1400020001 /* StreamProfile.swift in Sources */,
+				A1400030001 /* KeyframeIndex.swift in Sources */,
 				A1400003001 /* MediaAnalyzer.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

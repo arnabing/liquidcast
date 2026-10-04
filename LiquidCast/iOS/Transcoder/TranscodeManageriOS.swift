@@ -7,7 +7,7 @@ private let logger = Logger(subsystem: "com.liquidcast", category: "Transcoder")
 extension TranscodeManager {
 
     /// iOS does not support FFmpeg transcoding
-    func performConversion(from url: URL, mode: CompatibilityMode = .appleTV) async throws -> URL {
+    func performPreparation(from url: URL, mode: CompatibilityMode, startPosition: Double) async throws -> URL {
         logger.error("📱 Conversion not supported on iOS")
         throw TranscodeError.notSupportedOnPlatform
     }

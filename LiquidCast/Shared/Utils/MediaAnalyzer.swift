@@ -14,6 +14,9 @@ struct StreamInfo {
     let height: Int?
     let channels: Int?
     let sampleRate: Int?
+    /// Stream start (seconds, container timestamps) and length, if the container says
+    let startTime: Double?
+    let duration: Double?
 }
 
 /// Conversion path ordered by speed (lower = faster)
@@ -41,6 +44,8 @@ enum ConversionPath: Int, Comparable, CustomStringConvertible {
 struct MediaAnalysis {
     let container: String
     let duration: Double?
+    /// Container start time (seconds). FFmpeg seeks and timestamps are relative to this.
+    let startTime: Double
     let fileSize: Int64
     let videoStreams: [StreamInfo]
     let audioStreams: [StreamInfo]
@@ -55,6 +60,23 @@ struct MediaAnalysis {
     var is10BitVideo: Bool {
         guard let pixelFormat = primaryVideo?.pixelFormat else { return false }
         return pixelFormat.contains("10le") || pixelFormat.contains("10be") || pixelFormat.contains("p10")
+    }
+
+    /// 8-bit 4:2:0 H.264 in a profile Apple TV decodes - safe to pass through untouched
+    var isAppleDecodableH264: Bool {
+        guard isH264Video, let video = primaryVideo else { return false }
+        let pixelFormatOK = ["yuv420p", "yuvj420p"].contains(video.pixelFormat ?? "yuv420p")
+        let profileOK = ["baseline", "constrained baseline", "main", "high"].contains((video.profile ?? "high").lowercased())
+        return pixelFormatOK && profileOK
+    }
+
+    /// End of the video stream in media time (seconds from the container start). Audio often runs
+    /// past the video; segments must only cover what the video actually contains.
+    var videoEnd: Double? {
+        guard let duration else { return nil }
+        guard let video = primaryVideo, let videoDuration = video.duration, videoDuration > 0 else { return duration }
+        let videoStart = (video.startTime ?? startTime) - startTime
+        return min(duration, videoStart + videoDuration)
     }
 
     /// Check if container is AirPlay-compatible
@@ -93,17 +115,12 @@ struct MediaAnalysis {
             return .videoTranscode
         }
 
-        // 10-bit video needs transcode (AirPlay doesn't support it well)
-        if is10BitVideo {
+        // Anything but 8-bit 4:2:0 H.264 in a standard profile needs a full transcode
+        if !isAppleDecodableH264 {
             return .videoTranscode
         }
 
-        // Non-H.264 video needs full transcode
-        if !isH264Video {
-            return .videoTranscode
-        }
-
-        // At this point: H.264 video, 8-bit
+        // At this point: H.264 video, 8-bit 4:2:0
 
         // Check audio compatibility
         let needsAudioTranscode = !isAACCompatibleAudio
@@ -148,41 +165,28 @@ enum MediaAnalyzer {
         let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
         let fileSize = attrs?[.size] as? Int64 ?? 0
 
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: ffprobePath)
-        process.arguments = [
-            "-v", "quiet",
-            "-print_format", "json",
-            "-show_format",
-            "-show_streams",
-            "-analyzeduration", "10000000",  // 10 seconds max
-            "-probesize", "10000000",         // 10MB max
-            url.path
-        ]
+        let data: Data
+        do {
+            data = try await ProcessRunner.output(of: ffprobePath, arguments: [
+                "-v", "quiet",
+                "-print_format", "json",
+                "-show_format",
+                "-show_streams",
+                "-analyzeduration", "10000000",  // 10 seconds max
+                "-probesize", "10000000",         // 10MB max
+                url.path
+            ])
+        } catch {
+            throw MediaAnalyzerError.ffprobeFailed(error.localizedDescription)
+        }
 
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = FileHandle.nullDevice
-
-        return try await withCheckedThrowingContinuation { continuation in
-            process.terminationHandler = { _ in
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-
-                do {
-                    let analysis = try parseFFprobeOutput(data, fileSize: fileSize)
-                    logger.info("📊 \(analysis.summary)")
-                    continuation.resume(returning: analysis)
-                } catch {
-                    logger.error("❌ ffprobe parse failed: \(error.localizedDescription)")
-                    continuation.resume(throwing: error)
-                }
-            }
-
-            do {
-                try process.run()
-            } catch {
-                continuation.resume(throwing: MediaAnalyzerError.ffprobeFailed(error.localizedDescription))
-            }
+        do {
+            let analysis = try parseFFprobeOutput(data, fileSize: fileSize)
+            logger.info("📊 \(analysis.summary)")
+            return analysis
+        } catch {
+            logger.error("❌ ffprobe parse failed: \(error.localizedDescription)")
+            throw error
         }
     }
 
@@ -194,6 +198,15 @@ enum MediaAnalyzer {
 
     // MARK: - Private
 
+    /// Matroska stores per-stream length as a tag, e.g. "01:52:03.125000000"
+    static func parseClockDuration(_ text: String) -> Double? {
+        let parts = text.split(separator: ":")
+        guard parts.count == 3, let h = Double(parts[0]), let m = Double(parts[1]), let s = Double(parts[2]) else {
+            return nil
+        }
+        return h * 3600 + m * 60 + s
+    }
+
     private static func parseFFprobeOutput(_ data: Data, fileSize: Int64) throws -> MediaAnalysis {
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw MediaAnalyzerError.invalidOutput
@@ -203,6 +216,7 @@ enum MediaAnalyzer {
         let format = json["format"] as? [String: Any] ?? [:]
         let formatName = format["format_name"] as? String ?? "unknown"
         let duration = (format["duration"] as? String).flatMap { Double($0) }
+        let startTime = (format["start_time"] as? String).flatMap { Double($0) } ?? 0
 
         // Parse streams
         let streams = json["streams"] as? [[String: Any]] ?? []
@@ -211,6 +225,12 @@ enum MediaAnalyzer {
 
         for stream in streams {
             let codecType = stream["codec_type"] as? String ?? ""
+
+            // Cover art is exposed as a one-frame "video" stream - never treat it as the movie
+            let disposition = stream["disposition"] as? [String: Any]
+            if (disposition?["attached_pic"] as? Int) == 1 {
+                continue
+            }
 
             let info = StreamInfo(
                 index: stream["index"] as? Int ?? 0,
@@ -221,7 +241,10 @@ enum MediaAnalyzer {
                 width: stream["width"] as? Int,
                 height: stream["height"] as? Int,
                 channels: stream["channels"] as? Int,
-                sampleRate: (stream["sample_rate"] as? String).flatMap { Int($0) }
+                sampleRate: (stream["sample_rate"] as? String).flatMap { Int($0) },
+                startTime: (stream["start_time"] as? String).flatMap { Double($0) },
+                duration: (stream["duration"] as? String).flatMap { Double($0) }
+                    ?? ((stream["tags"] as? [String: Any])?["DURATION"] as? String).flatMap(parseClockDuration)
             )
 
             switch codecType {
@@ -234,10 +257,66 @@ enum MediaAnalyzer {
         return MediaAnalysis(
             container: formatName,
             duration: duration,
+            startTime: startTime,
             fileSize: fileSize,
             videoStreams: videoStreams,
             audioStreams: audioStreams
         )
+    }
+}
+
+/// Runs a command-line tool and collects its stdout.
+/// Output goes to a temporary file, not a pipe: a pipe deadlocks once the output exceeds its
+/// buffer (the child blocks on write) unless drained concurrently, and EOF never arrives if another
+/// child process spawned meanwhile inherited the pipe's write end.
+enum ProcessRunner {
+    static func output(of executablePath: String, arguments: [String]) async throws -> Data {
+        #if os(macOS)
+        let outputURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("liquidcast-\(UUID().uuidString).out")
+        guard FileManager.default.createFile(atPath: outputURL.path, contents: nil),
+              let outputHandle = try? FileHandle(forWritingTo: outputURL) else {
+            throw ProcessRunnerError.outputUnavailable
+        }
+        defer {
+            try? outputHandle.close()
+            try? FileManager.default.removeItem(at: outputURL)
+        }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executablePath)
+        process.arguments = arguments
+        process.standardOutput = outputHandle
+        process.standardError = FileHandle.nullDevice
+
+        let status: Int32 = try await withCheckedThrowingContinuation { continuation in
+            process.terminationHandler = { continuation.resume(returning: $0.terminationStatus) }
+            do {
+                try process.run()
+            } catch {
+                process.terminationHandler = nil
+                continuation.resume(throwing: error)
+            }
+        }
+        guard status == 0 else { throw ProcessRunnerError.exited(status: status) }
+        return try Data(contentsOf: outputURL)
+        #else
+        throw ProcessRunnerError.unsupported  // No subprocesses on iOS
+        #endif
+    }
+}
+
+enum ProcessRunnerError: LocalizedError {
+    case exited(status: Int32)
+    case outputUnavailable
+    case unsupported
+
+    var errorDescription: String? {
+        switch self {
+        case .exited(let status): return "Process exited with status \(status)"
+        case .outputUnavailable: return "Could not create a temporary file for process output"
+        case .unsupported: return "Running command-line tools is not supported on this platform"
+        }
     }
 }
 

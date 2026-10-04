@@ -128,9 +128,11 @@ class AppState: ObservableObject {
     // MARK: - Seeking State (for UI feedback and debouncing)
 
     @Published var isSeeking: Bool = false              // True during seek operation
+    @Published var isBuffering: Bool = false            // Player is waiting for data
     @Published var seekPreviewPosition: Double? = nil   // Preview position during drag (nil = not dragging)
 
     private var seekDebounceTask: Task<Void, Never>? = nil
+    private var seekCount = 0
 
     /// Formatted streaming info for display
     var streamingInfoText: String {
@@ -187,8 +189,19 @@ class AppState: ObservableObject {
     init() {
         loadPersistedSettings()
         setupBindings()
+        CacheManager.clearSessions()
         cleanupOldCacheFiles()
         CacheManager.removeDuplicates()
+
+        #if os(macOS)
+        // FFmpeg children outlive the app unless killed explicitly
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification, object: nil, queue: nil
+        ) { _ in
+            FFmpegProcess.killAll()
+            CacheManager.clearSessions()
+        }
+        #endif
     }
 
     // MARK: - Persistence
@@ -255,47 +268,37 @@ class AppState: ObservableObject {
             }
         }
 
+        mediaPlayer.onBufferingChanged = { [weak self] isBuffering in
+            Task { @MainActor in
+                self?.isBuffering = isBuffering
+            }
+        }
+
+        // Streams are published as complete VOD playlists, so player time is movie time
+        // and the duration is the full movie from the start
         mediaPlayer.onProgressChanged = { [weak self] progress, duration in
             Task { @MainActor in
-                // Add seek offset to get actual movie position
-                // HLS stream starts at 0, but movie may have started from offset (e.g., resume from 1565s)
-                let seekOffset = self?.transcodeManager.currentSeekOffset ?? 0
-                let actualProgress = progress + seekOffset
-                self?.playbackProgress = actualProgress
-
-                // Only update duration if valid and greater than current (HLS duration grows over time)
-                if duration > 0 && duration > (self?.duration ?? 0) {
-                    self?.duration = duration
+                guard let self else { return }
+                self.playbackProgress = progress
+                if duration > 0 {
+                    self.duration = duration
                 }
 
                 // Save playback position periodically (every 5 seconds, after 10 seconds in)
-                // Save the ACTUAL movie position, not raw HLS time
-                if let url = self?.selectedMediaURL,
-                   actualProgress > 10,
-                   Int(actualProgress) % 5 == 0 {
-                    CacheManager.savePlaybackPosition(for: url, position: actualProgress)
+                if let url = self.selectedMediaURL, progress > 10, Int(progress) % 5 == 0 {
+                    CacheManager.savePlaybackPosition(for: url, position: progress)
                 }
 
-                // Clear position when near end of SOURCE file (> 95% complete)
-                // Use sourceDuration (full movie length from ffprobe) not HLS duration
-                // to avoid premature clearing during live transcoding
-                let effectiveDuration = (self?.sourceDuration ?? 0) > 0 ? (self?.sourceDuration ?? 0) : duration
-                if actualProgress > 0 && effectiveDuration > 0 && actualProgress / effectiveDuration > 0.95 {
-                    if let url = self?.selectedMediaURL {
-                        CacheManager.clearPlaybackPosition(for: url)
-                    }
+                // Clear position when near the end (> 95% complete)
+                if progress > 0 && duration > 0 && progress / duration > 0.95, let url = self.selectedMediaURL {
+                    CacheManager.clearPlaybackPosition(for: url)
                 }
             }
         }
 
-        // Duration can update separately for HLS streams as more segments are loaded
         mediaPlayer.onDurationChanged = { [weak self] duration in
             Task { @MainActor in
-                // Only update if new duration is greater (HLS duration grows as transcoding progresses)
-                if duration > (self?.duration ?? 0) {
-                    appStateLogger.info("⏱️ Duration updated to \(Int(duration))s")
-                    self?.duration = duration
-                }
+                self?.duration = duration
             }
         }
 
@@ -337,7 +340,7 @@ class AppState: ObservableObject {
             .receive(on: DispatchQueue.main)
             .assign(to: &$sourceDuration)
 
-        // Pass source duration to media player (allows seeking beyond HLS transcoded portion)
+        // Pass source duration to media player (clamps seeks before the item has loaded)
         transcodeManager.$sourceDuration
             .receive(on: DispatchQueue.main)
             .sink { [weak self] duration in
@@ -351,9 +354,11 @@ class AppState: ObservableObject {
     func loadMedia(from url: URL) {
         appStateLogger.info("🎬 Loading media: \(url.lastPathComponent)")
 
-        // Cancel any previous load operation
+        // Cancel any previous load operation (also kills its FFmpeg and deletes its segments), and
+        // stop the old item so its progress isn't saved under the new file while this one prepares
         currentLoadTask?.cancel()
-        transcodeManager.cancel()  // Kill any running FFmpeg process
+        transcodeManager.stopStreaming()
+        mediaPlayer.unload()
 
         // Increment generation to invalidate any stale completions
         loadGeneration += 1
@@ -361,9 +366,8 @@ class AppState: ObservableObject {
 
         selectedMediaURL = url
         conversionError = nil
-
-        // Stop any existing HTTP server from previous conversion
-        transcodeManager.stopServer()
+        duration = 0
+        playbackProgress = 0
 
         // Clear previous streaming info
         clearStreamingInfo()
@@ -375,16 +379,13 @@ class AppState: ObservableObject {
             appStateLogger.info("📍 Found saved position: \(Int(savedPosition))s for \(url.lastPathComponent)")
         }
 
-        // Always use TranscodeManager for smart format detection
-        // It will return the original URL for compatible files (Path 0: direct playback)
-        // or convert as needed (Path 1-3: remux, audio transcode, full transcode)
-        // For HLS transcoding, pass startPosition so FFmpeg starts from resume point
+        // Direct-play files come back as-is; everything else as an HLS stream that already
+        // starts at the resume position (EXT-X-START), so only files need a seek
         currentLoadTask = Task {
             do {
-                let playableURL = try await transcodeManager.convertForAirPlay(
+                let playableURL = try await transcodeManager.prepareForAirPlay(
                     from: url,
                     mode: compatibilityMode,
-                    deviceName: currentAirPlayDevice,
                     startPosition: savedPosition
                 )
 
@@ -394,35 +395,11 @@ class AppState: ObservableObject {
                     return
                 }
 
-                if playableURL != url {
-                    appStateLogger.info("✅ Ready to play: \(playableURL.lastPathComponent)")
-                }
-
-                mediaPlayer.loadMedia(from: playableURL)
-
-                // For direct playback files (not HLS), we still need to seek
-                // HLS streams already start from the correct position
-                if savedPosition > 0 && playableURL.scheme != "http" {
-                    appStateLogger.info("📍 Seeking to saved position for direct playback: \(Int(savedPosition))s")
-                    let delay: Double = 1.0
-                    DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-                        guard let self = self, self.mediaPlayer.isReady else {
-                            appStateLogger.warning("⏳ Player not ready for seek, retrying...")
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-                                self?.mediaPlayer.seek(to: savedPosition)
-                                appStateLogger.info("▶️ Resumed from \(Int(savedPosition))s (retry)")
-                            }
-                            return
-                        }
-                        self.mediaPlayer.seek(to: savedPosition)
-                        appStateLogger.info("▶️ Resumed from \(Int(savedPosition))s")
-                    }
-                } else if savedPosition > 0 {
-                    appStateLogger.info("▶️ HLS stream starting from \(Int(savedPosition))s (no seek needed)")
-                }
+                appStateLogger.info("✅ Ready to play: \(playableURL.absoluteString)")
+                mediaPlayer.loadMedia(from: playableURL, startTime: playableURL.isFileURL ? savedPosition : 0)
             } catch {
-                // Ignore cancellation errors from superseded loads
-                if Task.isCancelled {
+                // Ignore errors from superseded loads
+                if Task.isCancelled || thisGeneration != loadGeneration {
                     appStateLogger.info("🚫 Load cancelled for: \(url.lastPathComponent)")
                     return
                 }
@@ -474,54 +451,15 @@ class AppState: ObservableObject {
     }
 
     func seek(to position: Double) {
-        appStateLogger.info("⏭️ Seeking to movie position: \(Int(position))s")
-
-        // Convert movie time to HLS time (subtract the offset FFmpeg started from)
-        let seekOffset = transcodeManager.currentSeekOffset
-        let hlsPosition = position - seekOffset
-
-        appStateLogger.info("⏭️ HLS position: \(Int(hlsPosition))s (offset: \(Int(seekOffset))s, duration: \(Int(self.duration))s)")
-
-        // Check if within current HLS transcoded range
-        // Also use normal seek if not streaming (direct playback or non-HLS)
-        if !isStreaming || (hlsPosition >= 0 && hlsPosition <= duration + 10) {
-            // Seek within transcoded content - use raw HLS position
-            let clampedHLS = max(0, hlsPosition)  // Don't seek to negative
-            mediaPlayer.seek(to: clampedHLS)
-            seekCompleted()
-            return
-        }
-
-        // Seeking beyond transcoded portion - restart FFmpeg from new position (YouTube-style)
-        guard let url = selectedMediaURL else {
-            appStateLogger.warning("⏭️ Cannot seek-restart: no source URL")
-            seekCompleted()
-            return
-        }
-
-        appStateLogger.info("🎯 Far seek detected: movie pos \(Int(position))s, HLS pos \(Int(hlsPosition))s beyond transcoded \(Int(self.duration))s - restarting transcode")
-
-        Task {
-            do {
-                // Restart transcoding from seek position
-                let playableURL = try await transcodeManager.seekTranscode(
-                    to: position,
-                    from: url,
-                    mode: compatibilityMode
-                )
-
-                // Reset duration (will grow as new transcode progresses)
-                duration = 0
-
-                // Load new HLS stream
-                mediaPlayer.loadMedia(from: playableURL)
-
-                appStateLogger.info("✅ Seek-restart complete, playing from \(Int(position))s")
-                seekCompleted()
-            } catch {
-                appStateLogger.error("❌ Seek-restart failed: \(error.localizedDescription)")
-                conversionError = error.localizedDescription
-                seekCompleted()
+        appStateLogger.info("⏭️ Seeking to \(Int(position))s")
+        isSeeking = true
+        seekCount += 1
+        let thisSeek = seekCount
+        mediaPlayer.seek(to: position) { [weak self] _ in
+            Task { @MainActor in
+                // An interrupted seek completes early; only the latest one ends the seeking state
+                guard let self, thisSeek == self.seekCount else { return }
+                self.seekCompleted()
             }
         }
     }

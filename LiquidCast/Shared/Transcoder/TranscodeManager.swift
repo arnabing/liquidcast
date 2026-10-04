@@ -8,7 +8,6 @@ enum TranscodeError: LocalizedError {
     case ffmpegNotFound
     case conversionFailed(String)
     case cancelled
-    case outputNotCreated
     case notSupportedOnPlatform
 
     var errorDescription: String? {
@@ -19,135 +18,76 @@ enum TranscodeError: LocalizedError {
             return "Conversion failed: \(message)"
         case .cancelled:
             return "Conversion was cancelled"
-        case .outputNotCreated:
-            return "Output file was not created"
         case .notSupportedOnPlatform:
             return "Video conversion is not supported on this platform. Please use an MP4 file."
         }
     }
 }
 
-/// Manages media file conversion using FFmpeg
-/// The actual implementation is in platform-specific extensions
+/// Turns a media file into something AirPlay can play: the file itself, or an on-demand HLS stream.
+/// The actual implementation is in platform-specific extensions.
 @MainActor
 class TranscodeManager: ObservableObject {
     // MARK: - Published Properties
 
-    @Published var isConverting = false
-    @Published var isStreaming = false  // True when HLS server is actively streaming
+    @Published var isConverting = false  // Analyzing/preparing before playback can start
+    @Published var isStreaming = false   // An HLS session is being served
     @Published var progress: Double = 0
     @Published var statusMessage: String = ""
     @Published var currentFileName: String = ""
-    @Published var ultraQualityAudio = false  // 320kbps AAC with 5.1 surround
+    @Published var ultraQualityAudio = false  // Higher video bitrates + 320kbps AAC keeping 5.1
 
     // Streaming info (populated after media analysis)
     @Published var outputResolution: String = ""     // "1080p" or "4K"
-    @Published var outputVideoCodec: String = ""     // "H.264" or "HEVC"
+    @Published var outputVideoCodec: String = ""     // "H.264"
     @Published var outputAudioCodec: String = ""     // "AAC"
     @Published var outputAudioChannels: String = ""  // "5.1" or "Stereo"
     @Published var sourceDuration: Double = 0        // Full source file duration from ffprobe
 
-    // MARK: - Internal Properties (accessed by extensions)
-
-    var isCancelled = false
-    var currentProcess: Any? = nil  // FFmpegProcess on macOS
-
-    // MARK: - Current Transcode State (for seek restart)
-
-    /// Current source URL being transcoded
-    var currentSourceURL: URL?
-    /// Current media analysis (cached for seek restart)
-    var currentAnalysis: MediaAnalysis?
-    /// Current compatibility mode
-    var currentMode: CompatibilityMode = .appleTV
-    /// Current seek offset (in seconds) - used when restarting from seek position
-    var currentSeekOffset: Double = 0
-
-    // MARK: - HTTP Server (for HLS streaming over AirPlay)
+    // MARK: - Streaming (macOS)
 
     #if os(macOS)
-    let httpServer = LocalHTTPServer()
+    /// Sessions the HTTP server may route to (read from the server's threads)
+    let sessionRegistry = HLSSessionRegistry()
+    /// Serves `/<session>/playlist.m3u8` and `/<session>/<index>.ts`. Started on first use, kept for the app's lifetime.
+    lazy var httpServer = LocalHTTPServer(handler: Self.makeRequestHandler(registry: sessionRegistry))
+    var activeSession: HLSSession?
+    /// Bumped on every prepare/stop, so a superseded preparation can tell it lost the race
+    var preparationGeneration = 0
     #endif
-
-    // MARK: - Device Detection
-
-    /// Device name currently being converted for (used for HEVC detection)
-    var currentDeviceName: String?
-
-    /// Whether the current device supports HEVC (detected from device name)
-    var deviceSupportsHEVC: Bool {
-        guard let name = currentDeviceName else { return false }
-        return CompatibilityMode.detectWithHEVC(from: name).hevcSupported
-    }
 
     // MARK: - Public Methods
 
-    /// Convert a media file to MP4 for AirPlay compatibility
+    /// Prepare a media file for AirPlay.
     /// - Parameters:
     ///   - url: Source file URL
     ///   - mode: Compatibility mode for target device (Apple TV allows more formats than Smart TVs)
-    ///   - deviceName: Name of the AirPlay device (used for HEVC capability detection)
-    ///   - startPosition: Optional start position in seconds (for resuming playback)
-    /// - Returns: URL to the converted MP4 file
-    func convertForAirPlay(from url: URL, mode: CompatibilityMode = .appleTV, deviceName: String? = nil, startPosition: Double = 0) async throws -> URL {
-        currentDeviceName = deviceName
-        currentSeekOffset = startPosition
-
-        if startPosition > 0 {
-            logger.info("🔄 convertForAirPlay called for: \(url.lastPathComponent) (mode: \(mode.rawValue), hevc: \(self.deviceSupportsHEVC), startAt: \(Int(startPosition))s)")
-        } else {
-            logger.info("🔄 convertForAirPlay called for: \(url.lastPathComponent) (mode: \(mode.rawValue), hevc: \(self.deviceSupportsHEVC))")
-        }
-
-        // Call the platform-specific implementation
-        // macOS: TranscodeManagerMacOS.swift provides the real implementation
-        // iOS: TranscodeManageriOS.swift provides a stub that throws
-        return try await performConversion(from: url, mode: mode, startPosition: startPosition)
+    ///   - startPosition: Resume position in seconds. HLS streams start there by themselves;
+    ///     for a returned file URL the caller seeks.
+    /// - Returns: The file URL itself (directly playable) or an http:// HLS playlist URL
+    func prepareForAirPlay(from url: URL, mode: CompatibilityMode = .appleTV, startPosition: Double = 0) async throws -> URL {
+        logger.info("🔄 Preparing \(url.lastPathComponent) (mode: \(mode.rawValue), start: \(Int(startPosition))s)")
+        return try await performPreparation(from: url, mode: mode, startPosition: startPosition)
     }
 
-    /// Cancel the current conversion
-    func cancel() {
-        logger.info("Cancelling conversion...")
-        isCancelled = true
-        statusMessage = "Cancelling..."
-
+    /// Stop the current stream (kills FFmpeg, deletes its segments)
+    func stopStreaming() {
         #if os(macOS)
-        cancelMacOSProcess()
-        #endif
-    }
-
-    #if os(macOS)
-    /// Cancel the FFmpeg process on macOS
-    private func cancelMacOSProcess() {
-        if let ffmpegProcess = currentProcess as? FFmpegProcess {
-            Task {
-                await ffmpegProcess.terminate()
-            }
+        preparationGeneration += 1
+        if let session = activeSession {
+            activeSession = nil
+            sessionRegistry.remove(session)
+            Task { await session.stop() }
         }
-    }
-    #endif
-
-    /// Stop the HTTP server (call when loading new media or cleaning up)
-    func stopServer() {
-        #if os(macOS)
-        httpServer.stop()
+        isConverting = false
         isStreaming = false
         #endif
     }
 
-    /// Restart transcoding from a specific position (for seeking beyond transcoded content)
-    /// - Parameters:
-    ///   - position: The seek position in seconds
-    ///   - sourceURL: The source file URL
-    ///   - mode: Compatibility mode for target device
-    /// - Returns: URL to the new HLS stream starting from the seek position
-    func seekTranscode(to position: Double, from sourceURL: URL, mode: CompatibilityMode) async throws -> URL {
-        logger.info("🎯 Seek-restart transcoding to \(Int(position))s")
-
-        #if os(macOS)
-        return try await performSeekTranscode(to: position, from: sourceURL, mode: mode)
-        #else
-        throw TranscodeError.notSupportedOnPlatform
-        #endif
+    /// Cancel an in-progress preparation
+    func cancel() {
+        logger.info("Cancelling conversion...")
+        statusMessage = "Cancelled"
+        stopStreaming()
     }
 }

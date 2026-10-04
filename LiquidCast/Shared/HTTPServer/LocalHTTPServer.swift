@@ -1,425 +1,249 @@
 import Foundation
 import Network
+import os
 import os.log
 
 private let logger = Logger(subsystem: "com.liquidcast", category: "HTTPServer")
 
-/// Local HTTP server for serving HLS streams to AirPlay devices
-/// Uses Apple's Network.framework - no external dependencies needed
-/// AirPlay requires http:// URLs - local file:// URLs don't work for remote playback
-@MainActor
-class LocalHTTPServer {
+struct HTTPRequest: Sendable {
+    let method: String
+    /// Decoded path without the leading "/" and without a query string
+    let path: String
+}
+
+struct HTTPResponse: Sendable {
+    let status: Int
+    let contentType: String
+    let body: Data
+
+    static func ok(_ body: Data, contentType: String) -> HTTPResponse {
+        HTTPResponse(status: 200, contentType: contentType, body: body)
+    }
+
+    static func error(_ status: Int) -> HTTPResponse {
+        HTTPResponse(status: status, contentType: "text/plain", body: Data(reasonPhrase(status).utf8))
+    }
+
+    static func reasonPhrase(_ status: Int) -> String {
+        switch status {
+        case 200: return "OK"
+        case 400: return "Bad Request"
+        case 404: return "Not Found"
+        case 405: return "Method Not Allowed"
+        case 503: return "Service Unavailable"
+        default: return "Internal Server Error"
+        }
+    }
+}
+
+/// Minimal HTTP/1.1 server (Network.framework) that AirPlay receivers fetch HLS from.
+/// AirPlay needs http:// URLs reachable from the receiver; file:// URLs don't work remotely.
+///
+/// Runs entirely off the main thread. Each request is answered by an async handler, so a
+/// handler can wait (e.g. for a segment that is still being encoded) without blocking others.
+final class LocalHTTPServer: @unchecked Sendable {
+    typealias Handler = @Sendable (HTTPRequest) async -> HTTPResponse
+
+    private let handler: Handler
+    private let queue = DispatchQueue(label: "com.liquidcast.http", qos: .userInitiated)
+    private let lock = NSLock()
     private var listener: NWListener?
-    private var connections: [NWConnection] = []
-    private var servingDirectory: URL?
-    private var assignedPort: UInt16 = 0
-    private var sessionId: String?
+    private var port: UInt16 = 0
+    /// In-flight start, shared by concurrent callers so only one listener is ever created
+    private var startTask: Task<Void, Error>?
 
-    var isRunning: Bool { listener?.state == .ready }
+    private static let ports: [UInt16] = Array(8765...8775) + Array(9876...9885)
+    private static let maxRequestSize = 16 * 1024
+    /// Drop connections that don't send a complete request in time (idle/half-open clients)
+    private static let requestTimeout: TimeInterval = 15
 
+    init(handler: @escaping Handler) {
+        self.handler = handler
+    }
+
+    var isRunning: Bool { lock.withLock { listener != nil } }
+
+    /// Base URL using this Mac's LAN address (receivers can't reach localhost)
     var baseURL: URL? {
-        guard isRunning, assignedPort > 0 else { return nil }
-        // Use the actual local IP address instead of localhost
-        // AirPlay devices need to connect to our Mac's IP, not localhost
-        guard let ip = getLocalIPAddress() else {
-            return URL(string: "http://localhost:\(assignedPort)/")
-        }
-        return URL(string: "http://\(ip):\(assignedPort)/")
+        let port = lock.withLock { self.port }
+        guard port > 0 else { return nil }
+        let host = LocalNetwork.primaryIPv4Address() ?? "localhost"
+        return URL(string: "http://\(host):\(port)/")
     }
 
-    /// Get the local IP address that AirPlay devices can connect to
-    private func getLocalIPAddress() -> String? {
-        var address: String?
-        var ifaddr: UnsafeMutablePointer<ifaddrs>?
-
-        guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else {
-            return nil
+    /// Start listening on the first free port. No-op if already running; concurrent calls share one start.
+    func start() async throws {
+        let task = lock.withLock { () -> Task<Void, Error> in
+            if let startTask { return startTask }
+            let task = Task { try await self.listenOnFreePort() }
+            startTask = task
+            return task
         }
+        do {
+            try await task.value
+        } catch {
+            lock.withLock { startTask = nil }  // Allow a retry
+            throw error
+        }
+    }
 
-        defer { freeifaddrs(ifaddr) }
-
-        for ptr in sequence(first: firstAddr, next: { $0.pointee.ifa_next }) {
-            let interface = ptr.pointee
-            let addrFamily = interface.ifa_addr.pointee.sa_family
-
-            // Check for IPv4 interface
-            if addrFamily == UInt8(AF_INET) {
-                let name = String(cString: interface.ifa_name)
-                // Prefer en0 (WiFi) or en1 (Ethernet)
-                if name == "en0" || name == "en1" {
-                    var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-                    getnameinfo(interface.ifa_addr, socklen_t(interface.ifa_addr.pointee.sa_len),
-                               &hostname, socklen_t(hostname.count),
-                               nil, socklen_t(0), NI_NUMERICHOST)
-                    address = String(cString: hostname)
-                    break
+    private func listenOnFreePort() async throws {
+        for port in Self.ports {
+            if let listener = await startListener(on: port) {
+                lock.withLock {
+                    self.listener = listener
+                    self.port = port
                 }
+                logger.info("HTTP server listening on port \(port)")
+                return
             }
         }
-
-        return address
-    }
-
-    /// Start serving files from the specified directory
-    /// - Parameter directory: Directory containing HLS playlist and segments
-    /// - Returns: Base URL for accessing the served content
-    func startServing(directory: URL) throws -> URL {
-        // If already serving the same directory, return existing URL
-        if isRunning, servingDirectory == directory, let base = baseURL {
-            logger.info("[\(self.sessionId ?? "?")] HTTP server already serving: \(base.absoluteString)")
-            return base
-        }
-
-        // Stop any existing server
-        forceStop()
-
-        sessionId = UUID().uuidString.prefix(8).description
-        servingDirectory = directory
-
-        // Try ports in sequence (expanded range)
-        let ports: [UInt16] = Array(8765...8775) + Array(9876...9885)
-
-        for port in ports {
-            if let url = tryStartListener(on: port, directory: directory) {
-                return url
-            }
-        }
-
         throw LocalHTTPServerError.noAvailablePort
     }
 
-    /// Try to start listener on a specific port
-    /// - Returns: Base URL if successful, nil if port unavailable
-    private func tryStartListener(on port: UInt16, directory: URL) -> URL? {
-        do {
-            let params = NWParameters.tcp
-            params.allowLocalEndpointReuse = true
+    func stop() {
+        let listener = lock.withLock { () -> NWListener? in
+            let current = self.listener
+            self.listener = nil
+            self.port = 0
+            self.startTask = nil
+            return current
+        }
+        listener?.cancel()
+    }
 
-            let listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!)
+    private func startListener(on port: UInt16) async -> NWListener? {
+        guard let endpointPort = NWEndpoint.Port(rawValue: port),
+              let listener = try? NWListener(using: .tcp, on: endpointPort) else {
+            return nil
+        }
 
-            // Use semaphore for synchronous wait (instead of Thread.sleep)
-            let semaphore = DispatchSemaphore(value: 0)
+        listener.newConnectionHandler = { [weak self] connection in
+            self?.handle(connection)
+        }
 
-            // Use thread-safe class wrapper for mutable state accessed in closure
-            final class ListenerState: @unchecked Sendable {
-                var ready = false
-                var failed = false
+        let ready: Bool = await withCheckedContinuation { continuation in
+            let resumed = OSAllocatedUnfairLock(initialState: false)
+            let finish: @Sendable (Bool) -> Void = { result in
+                let first = resumed.withLock { done -> Bool in
+                    defer { done = true }
+                    return !done
+                }
+                if first { continuation.resume(returning: result) }
             }
-            let state = ListenerState()
-
-            // Capture sessionId value for use in closure (avoids MainActor isolation issue)
-            let currentSessionId = sessionId
-
-            listener.stateUpdateHandler = { listenerState in
-                switch listenerState {
-                case .ready:
-                    state.ready = true
-                    semaphore.signal()
-                case .failed(let error):
-                    logger.error("[\(currentSessionId ?? "?")] HTTP server failed on port \(port): \(error.localizedDescription)")
-                    state.failed = true
-                    semaphore.signal()
-                case .cancelled:
-                    semaphore.signal()
-                default:
-                    break
+            listener.stateUpdateHandler = { state in
+                switch state {
+                case .ready: finish(true)
+                case .failed, .cancelled: finish(false)
+                default: break
                 }
             }
+            listener.start(queue: queue)
+        }
 
-            listener.newConnectionHandler = { [weak self] connection in
-                Task { @MainActor in
-                    self?.handleConnection(connection)
-                }
-            }
-
-            // Start on a background queue to avoid blocking main
-            listener.start(queue: DispatchQueue.global(qos: .userInitiated))
-
-            // Wait up to 2 seconds for listener to become ready
-            let result = semaphore.wait(timeout: .now() + 2.0)
-
-            if result == .timedOut {
-                logger.warning("[\(self.sessionId ?? "?")] Timeout waiting for port \(port)")
-                listener.cancel()
-                return nil
-            }
-
-            if state.ready && !state.failed {
-                self.listener = listener
-                self.assignedPort = port
-                // Use actual IP address for AirPlay devices
-                let ip = getLocalIPAddress() ?? "localhost"
-                let url = URL(string: "http://\(ip):\(port)/")!
-                logger.info("[\(self.sessionId ?? "?")] HTTP server started on port \(port) at \(ip) serving: \(directory.lastPathComponent)")
-                return url
-            }
-
+        guard ready else {
             listener.cancel()
             return nil
-
-        } catch {
-            logger.warning("[\(self.sessionId ?? "?")] Port \(port) unavailable: \(error.localizedDescription)")
-            return nil
         }
-    }
-
-    /// Stop the HTTP server (graceful)
-    func stop() {
-        guard listener != nil else { return }
-        forceStop()
-    }
-
-    /// Force stop regardless of state - use for cleanup on errors
-    func forceStop() {
-        let connCount = connections.count
-        let hadListener = listener != nil
-        let sid = sessionId ?? "none"
-
-        logger.info("[\(sid)] forceStop: cancelling \(connCount) connections, listener=\(hadListener)")
-
-        for connection in connections {
-            connection.cancel()
-        }
-        connections.removeAll()
-
-        listener?.cancel()
-        listener = nil
-
-        logger.info("[\(sid)] HTTP server stopped")
-
-        servingDirectory = nil
-        assignedPort = 0
-        sessionId = nil
-    }
-
-    // MARK: - Connection Handling
-
-    private func handleConnection(_ connection: NWConnection) {
-        connections.append(connection)
-
-        connection.stateUpdateHandler = { [weak self, weak connection] state in
-            if case .cancelled = state {
-                if let conn = connection {
-                    Task { @MainActor in
-                        self?.connections.removeAll { $0 === conn }
-                    }
-                }
+        listener.stateUpdateHandler = { state in
+            if case .failed(let error) = state {
+                logger.error("HTTP listener failed: \(error.localizedDescription)")
             }
         }
-
-        connection.start(queue: .main)
-        receiveRequest(on: connection)
+        return listener
     }
 
-    private func receiveRequest(on connection: NWConnection) {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
-            guard let data = data, !data.isEmpty else {
-                if isComplete || error != nil {
-                    connection.cancel()
-                }
-                return
-            }
+    // MARK: - Connections
 
-            if let request = String(data: data, encoding: .utf8) {
-                Task { @MainActor in
-                    self?.handleHTTPRequest(request, on: connection)
-                }
-            } else {
+    /// Per-connection state, touched only on `queue`
+    private final class Exchange: @unchecked Sendable {
+        var receivedRequest = false
+        var handlerTask: Task<Void, Never>?
+    }
+
+    private func handle(_ connection: NWConnection) {
+        let exchange = Exchange()
+        connection.stateUpdateHandler = { state in
+            switch state {
+            case .failed, .cancelled:
+                // Client went away: stop waiting for its segment
+                exchange.handlerTask?.cancel()
+            default:
+                break
+            }
+        }
+        connection.start(queue: queue)
+        queue.asyncAfter(deadline: .now() + Self.requestTimeout) {
+            if !exchange.receivedRequest { connection.cancel() }
+        }
+        receive(on: connection, exchange: exchange, buffer: Data())
+    }
+
+    /// Accumulate until the end of the request headers (requests can arrive in several packets)
+    private func receive(on connection: NWConnection, exchange: Exchange, buffer: Data) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: Self.maxRequestSize) { [weak self] data, _, isComplete, error in
+            guard let self else { return connection.cancel() }
+
+            var buffer = buffer
+            if let data { buffer.append(data) }
+
+            if let headerEnd = buffer.range(of: Data("\r\n\r\n".utf8)) {
+                exchange.receivedRequest = true
+                self.respond(to: buffer[..<headerEnd.lowerBound], exchange: exchange, on: connection)
+            } else if error != nil || isComplete || buffer.count > Self.maxRequestSize {
                 connection.cancel()
-            }
-        }
-    }
-
-    private func handleHTTPRequest(_ request: String, on connection: NWConnection) {
-        // Parse the request line (e.g., "GET /playlist.m3u8 HTTP/1.1")
-        let lines = request.components(separatedBy: "\r\n")
-        guard let requestLine = lines.first else {
-            sendErrorResponse(404, on: connection)
-            return
-        }
-
-        let parts = requestLine.components(separatedBy: " ")
-        guard parts.count >= 2, parts[0] == "GET" else {
-            sendErrorResponse(405, on: connection)
-            return
-        }
-
-        // Decode URL path
-        var path = parts[1]
-        if path.hasPrefix("/") {
-            path = String(path.dropFirst())
-        }
-        path = path.removingPercentEncoding ?? path
-
-        // Remove query string if present
-        if let queryIndex = path.firstIndex(of: "?") {
-            path = String(path[..<queryIndex])
-        }
-
-        guard let directory = servingDirectory else {
-            sendErrorResponse(500, on: connection)
-            return
-        }
-
-        let fileURL = directory.appendingPathComponent(path)
-
-        // Security: ensure the file is within the serving directory
-        guard fileURL.path.hasPrefix(directory.path) else {
-            sendErrorResponse(403, on: connection)
-            return
-        }
-
-        // Read and send the file
-        guard FileManager.default.fileExists(atPath: fileURL.path) else {
-            logger.warning("File not found: \(path)")
-            sendErrorResponse(404, on: connection)
-            return
-        }
-
-        do {
-            var fileData: Data
-
-            // For playlist files, filter to only include existing segments
-            if path.hasSuffix(".m3u8") {
-                let filteredPlaylist = filterPlaylistToExistingSegments(playlistURL: fileURL, directory: directory)
-                fileData = Data(filteredPlaylist.utf8)
             } else {
-                fileData = try Data(contentsOf: fileURL)
+                self.receive(on: connection, exchange: exchange, buffer: buffer)
             }
-
-            let contentType = mimeType(for: fileURL.pathExtension)
-
-            let headers = """
-            HTTP/1.1 200 OK\r
-            Content-Type: \(contentType)\r
-            Content-Length: \(fileData.count)\r
-            Access-Control-Allow-Origin: *\r
-            Cache-Control: no-cache\r
-            Connection: close\r
-            \r
-
-            """
-
-            var response = Data(headers.utf8)
-            response.append(fileData)
-
-            connection.send(content: response, completion: .contentProcessed { _ in
-                connection.cancel()
-            })
-
-            logger.debug("Served: \(path) (\(fileData.count) bytes)")
-        } catch {
-            logger.error("Error reading file \(path): \(error.localizedDescription)")
-            sendErrorResponse(500, on: connection)
         }
     }
 
-    /// Filter HLS playlist to only include segments that actually exist on disk
-    /// This is critical for live transcoding where FFmpeg writes the full playlist
-    /// but segments are created progressively
-    private func filterPlaylistToExistingSegments(playlistURL: URL, directory: URL) -> String {
-        guard let playlistContent = try? String(contentsOf: playlistURL, encoding: .utf8) else {
-            return ""
+    private func respond(to header: Data, exchange: Exchange, on connection: NWConnection) {
+        guard let request = Self.parse(header) else {
+            send(.error(400), method: "GET", on: connection)
+            return
         }
-
-        var filteredLines: [String] = []
-        let lines = playlistContent.components(separatedBy: "\n")
-        var existingSegments: [(extinf: String, segment: String)] = []
-
-        // First pass: collect all segments and check existence
-        var i = 0
-        while i < lines.count {
-            let line = lines[i].trimmingCharacters(in: .whitespaces)
-
-            if line.hasPrefix("#EXTINF:") {
-                // This line is followed by a segment filename
-                let nextIndex = i + 1
-                if nextIndex < lines.count {
-                    let segmentLine = lines[nextIndex].trimmingCharacters(in: .whitespaces)
-                    if !segmentLine.isEmpty && !segmentLine.hasPrefix("#") {
-                        let segmentURL = directory.appendingPathComponent(segmentLine)
-                        if FileManager.default.fileExists(atPath: segmentURL.path) {
-                            // Verify segment is complete (> 10KB minimum to avoid partial writes)
-                            if let attrs = try? FileManager.default.attributesOfItem(atPath: segmentURL.path),
-                               let size = attrs[.size] as? Int64,
-                               size > 10_000 {
-                                existingSegments.append((extinf: line, segment: segmentLine))
-                            }
-                        }
-                    }
-                }
-                i += 2
-                continue
-            }
-            i += 1
+        guard request.method == "GET" || request.method == "HEAD" else {
+            send(.error(405), method: request.method, on: connection)
+            return
         }
-
-        // Build filtered playlist
-        // Copy header lines
-        for line in lines {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if trimmed.hasPrefix("#EXTM3U") ||
-               trimmed.hasPrefix("#EXT-X-VERSION") ||
-               trimmed.hasPrefix("#EXT-X-TARGETDURATION") ||
-               trimmed.hasPrefix("#EXT-X-MEDIA-SEQUENCE") ||
-               trimmed.hasPrefix("#EXT-X-PLAYLIST-TYPE") ||
-               trimmed.hasPrefix("#EXT-X-INDEPENDENT-SEGMENTS") {
-                filteredLines.append(line)
-            }
+        exchange.handlerTask = Task {
+            let response = await handler(request)
+            guard !Task.isCancelled else { return }
+            send(response, method: request.method, on: connection)
         }
-
-        // Add only existing segments (in order)
-        for segment in existingSegments {
-            filteredLines.append(segment.extinf)
-            filteredLines.append(segment.segment)
-        }
-
-        // Don't add #EXT-X-ENDLIST unless transcoding is complete
-        // (We can detect this by checking if FFmpeg is still running,
-        // but for now we check if the original playlist has it AND all segments exist)
-        let originalHasEndList = playlistContent.contains("#EXT-X-ENDLIST")
-        if originalHasEndList {
-            // Count segments in original playlist
-            let originalSegmentCount = lines.filter { $0.hasSuffix(".ts") }.count
-            if existingSegments.count >= originalSegmentCount {
-                filteredLines.append("#EXT-X-ENDLIST")
-            }
-        }
-
-        return filteredLines.joined(separator: "\n")
     }
 
-    private func sendErrorResponse(_ code: Int, on connection: NWConnection) {
-        let message: String
-        switch code {
-        case 403: message = "Forbidden"
-        case 404: message = "Not Found"
-        case 405: message = "Method Not Allowed"
-        default: message = "Internal Server Error"
+    private func send(_ response: HTTPResponse, method: String, on connection: NWConnection) {
+        var head = "HTTP/1.1 \(response.status) \(HTTPResponse.reasonPhrase(response.status))\r\n"
+        head += "Content-Type: \(response.contentType)\r\n"
+        head += "Content-Length: \(response.body.count)\r\n"
+        head += "Cache-Control: no-cache\r\n"
+        head += "Access-Control-Allow-Origin: *\r\n"
+        head += "Connection: close\r\n\r\n"
+
+        var payload = Data(head.utf8)
+        if method != "HEAD" {
+            payload.append(response.body)
         }
-
-        let response = """
-        HTTP/1.1 \(code) \(message)\r
-        Content-Type: text/plain\r
-        Content-Length: \(message.count)\r
-        Connection: close\r
-        \r
-        \(message)
-        """
-
-        connection.send(content: Data(response.utf8), completion: .contentProcessed { _ in
+        connection.send(content: payload, isComplete: true, completion: .contentProcessed { _ in
             connection.cancel()
         })
     }
 
-    private func mimeType(for ext: String) -> String {
-        switch ext.lowercased() {
-        case "m3u8": return "application/vnd.apple.mpegurl"
-        case "ts": return "video/mp2t"
-        case "mp4", "m4v": return "video/mp4"
-        case "m4s": return "video/iso.segment"
-        default: return "application/octet-stream"
+    static func parse(_ header: Data) -> HTTPRequest? {
+        guard let text = String(data: header, encoding: .utf8),
+              let requestLine = text.components(separatedBy: "\r\n").first else { return nil }
+        let parts = requestLine.split(separator: " ")
+        guard parts.count >= 2 else { return nil }
+
+        var path = String(parts[1])
+        if let query = path.firstIndex(of: "?") {
+            path = String(path[..<query])
         }
+        path = path.removingPercentEncoding ?? path
+        while path.hasPrefix("/") { path.removeFirst() }
+        return HTTPRequest(method: String(parts[0]), path: path)
     }
 }
 
@@ -429,7 +253,42 @@ enum LocalHTTPServerError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .noAvailablePort:
-            return "No available port for HTTP server. Ports 8765-8769 and 9876-9877 are all in use."
+            return "No available port for the streaming server (tried 8765-8775 and 9876-9885)."
         }
+    }
+}
+
+enum LocalNetwork {
+    /// IPv4 address of the active LAN interface (Wi-Fi or Ethernet, including USB/Thunderbolt adapters)
+    static func primaryIPv4Address() -> String? {
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0, let first = ifaddr else { return nil }
+        defer { freeifaddrs(ifaddr) }
+
+        var candidates: [(name: String, address: String)] = []
+        for pointer in sequence(first: first, next: { $0.pointee.ifa_next }) {
+            let interface = pointer.pointee
+            let flags = Int32(interface.ifa_flags)
+            guard let addr = interface.ifa_addr,
+                  addr.pointee.sa_family == UInt8(AF_INET),
+                  flags & IFF_UP != 0, flags & IFF_RUNNING != 0, flags & IFF_LOOPBACK == 0 else { continue }
+
+            let name = String(cString: interface.ifa_name)
+            guard name.hasPrefix("en") else { continue }  // Skips utun (VPN), awdl, bridge, etc.
+
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            guard getnameinfo(addr, socklen_t(addr.pointee.sa_len), &host, socklen_t(host.count),
+                              nil, 0, NI_NUMERICHOST) == 0 else { continue }
+            let address = String(cString: host)
+            guard !address.hasPrefix("169.254.") else { continue }  // Link-local: no DHCP lease
+            candidates.append((name, address))
+        }
+
+        // Prefer en0, then the lowest-numbered interface
+        return candidates.min { lhs, rhs in
+            let l = Int(lhs.name.dropFirst(2)) ?? .max
+            let r = Int(rhs.name.dropFirst(2)) ?? .max
+            return l < r
+        }?.address
     }
 }

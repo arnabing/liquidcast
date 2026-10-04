@@ -76,7 +76,7 @@ Access from the menu bar:
 
 - **Ultra Quality** — Maximum bitrates, 5.1 surround preserved
 - **Target Device** — Apple TV (best) or Smart TV (compatible)
-- **Clear Cache** — Delete converted files
+- **Clear Cache** — Delete cached data (keyframe indexes)
 
 ## Project Structure
 
@@ -90,16 +90,19 @@ LiquidCast/
 │   └── Utils/                   # MediaAnalyzer, CacheManager
 ├── macOS/
 │   ├── Views/MiniPlayerView.swift
-│   └── Transcoder/              # FFmpeg process management
+│   └── Transcoder/              # On-demand HLS: sessions, segment plans, FFmpeg jobs
 └── iOS/                         # iOS support (limited)
 ```
 
 ## Under the Hood
 
-- **HLS Streaming** — Start watching while the file converts
+- **On-demand HLS** — Playback starts in about a second; the whole movie is seekable immediately, and segments are encoded as the TV asks for them
+- **Stream copy when possible** — H.264 video is passed through untouched; only the audio is converted
 - **Hardware encoding** — Uses your Mac's VideoToolbox for speed
 - **Local server** — Streams to Apple TV over your network
 - **Minimal dependencies** — Just FFmpeg + Apple frameworks
+
+See [docs/STREAMING.md](docs/STREAMING.md) for how streaming works.
 
 ## License
 

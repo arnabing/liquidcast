@@ -19,10 +19,12 @@ class MediaPlayerController: NSObject, ObservableObject {
     // MARK: - Callbacks
 
     var onPlaybackStateChanged: ((Bool) -> Void)?
+    /// True while the player wants to play but is waiting for data
+    var onBufferingChanged: ((Bool) -> Void)?
     var onProgressChanged: ((Double, Double) -> Void)?
     var onDurationChanged: ((Double) -> Void)?
 
-    // MARK: - Source Duration (for seeking beyond HLS duration)
+    // MARK: - Source Duration (clamps seeks before the item reports its duration)
 
     /// Full source duration from ffprobe - allows seeking beyond transcoded portion
     var sourceDuration: Double = 0
@@ -32,12 +34,16 @@ class MediaPlayerController: NSObject, ObservableObject {
     private var timeObserver: Any?
     private var durationObserver: NSKeyValueObservation?
     private var cancellables = Set<AnyCancellable>()
+    /// Observers of the current item only (replaced on every load, so stale items can't act)
+    private var itemCancellables = Set<AnyCancellable>()
 
     // MARK: - Sleep Prevention
 
     #if os(macOS)
     private var sleepAssertionID: IOPMAssertionID = 0
     private var isSleepPrevented: Bool = false
+    /// Opts out of App Nap, which otherwise throttles the HLS server/FFmpeg when the window is hidden
+    private var appNapActivity: NSObjectProtocol?
     #else
     private var backgroundActivity: NSObjectProtocol?
     #endif
@@ -87,9 +93,9 @@ class MediaPlayerController: NSObject, ObservableObject {
             guard let self = self,
                   let duration = self.playerItem?.duration,
                   duration.isValid && !duration.isIndefinite else { return }
+            let totalSeconds = duration.seconds
 
             let currentSeconds = time.seconds
-            let totalSeconds = duration.seconds
 
             self.onProgressChanged?(currentSeconds, totalSeconds)
         }
@@ -113,6 +119,7 @@ class MediaPlayerController: NSObject, ObservableObject {
                 }
 
                 self?.onPlaybackStateChanged?(isPlaying)
+                self?.onBufferingChanged?(status == .waitingToPlayAtSpecifiedRate)
             }
             .store(in: &cancellables)
     }
@@ -142,8 +149,10 @@ class MediaPlayerController: NSObject, ObservableObject {
 
     // MARK: - Media Loading
 
-    func loadMedia(from url: URL) {
-        logger.info("📂 Loading media from: \(url.path)")
+    /// - Parameter startTime: Position to seek to before playback starts (HLS streams carry
+    ///   their own start position in the playlist, so pass 0 for those)
+    func loadMedia(from url: URL, startTime: Double = 0) {
+        logger.info("📂 Loading media from: \(url.absoluteString)")
         logger.info("📂 URL scheme: \(url.scheme ?? "nil")")
         logger.info("📂 Is file URL: \(url.isFileURL)")
 
@@ -172,8 +181,11 @@ class MediaPlayerController: NSObject, ObservableObject {
         }
 
         let playerItem = AVPlayerItem(asset: asset)
+        itemCancellables.removeAll()
+        isReady = false
 
         // Observe when ready to play
+        var hasStarted = false
         playerItem.publisher(for: \.status)
             .sink { [weak self] status in
                 switch status {
@@ -181,7 +193,13 @@ class MediaPlayerController: NSObject, ObservableObject {
                     logger.info("✅ PlayerItem ready to play")
                     self?.isReady = true
                     self?.error = nil
-                    self?.play()  // Auto-play when ready
+                    guard !hasStarted else { return }
+                    hasStarted = true
+                    if startTime > 0 {
+                        self?.seek(to: startTime) { _ in self?.play() }
+                    } else {
+                        self?.play()  // Auto-play when ready
+                    }
                 case .failed:
                     logger.error("❌ PlayerItem failed: \(playerItem.error?.localizedDescription ?? "unknown")")
                     self?.isReady = false
@@ -192,7 +210,7 @@ class MediaPlayerController: NSObject, ObservableObject {
                     break
                 }
             }
-            .store(in: &cancellables)
+            .store(in: &itemCancellables)
 
         // Observe player item errors
         playerItem.publisher(for: \.error)
@@ -201,7 +219,7 @@ class MediaPlayerController: NSObject, ObservableObject {
                     logger.error("❌ PlayerItem error: \(error.localizedDescription)")
                 }
             }
-            .store(in: &cancellables)
+            .store(in: &itemCancellables)
 
         self.playerItem = playerItem
         player?.replaceCurrentItem(with: playerItem)
@@ -218,6 +236,18 @@ class MediaPlayerController: NSObject, ObservableObject {
     }
 
     // MARK: - Playback Control
+
+    /// Stop and drop the current item (e.g. while the next file is being prepared, so the old
+    /// item's progress can't be attributed to the new file)
+    func unload() {
+        itemCancellables.removeAll()
+        durationObserver = nil
+        player?.pause()
+        player?.replaceCurrentItem(with: nil)
+        playerItem = nil
+        isReady = false
+        allowSleep()
+    }
 
     func play() {
         logger.info("▶️ Play requested")
@@ -240,33 +270,30 @@ class MediaPlayerController: NSObject, ObservableObject {
         logger.info("⏸️ player rate after: \(self.player?.rate ?? -1)")
     }
 
-    func seek(to progress: Double) {
-        guard playerItem != nil else {
+    /// Seek to a position in seconds. `completion` receives false if the seek was interrupted
+    /// by another seek. (Streams expose their full duration, so any position is seekable.)
+    func seek(to position: Double, completion: ((Bool) -> Void)? = nil) {
+        guard let player, let playerItem else {
             logger.warning("⏭️ Cannot seek: no player item")
+            completion?(false)
             return
         }
 
-        // Use source duration if available (allows seeking beyond HLS transcoded portion)
-        // Otherwise fall back to player item duration
         let maxDuration: Double
-        if sourceDuration > 0 {
-            maxDuration = sourceDuration
-        } else if let duration = playerItem?.duration,
-                  duration.isValid && !duration.isIndefinite {
-            maxDuration = duration.seconds
+        if playerItem.duration.isValid && !playerItem.duration.isIndefinite {
+            maxDuration = playerItem.duration.seconds
         } else {
-            logger.warning("⏭️ Cannot seek: duration unknown")
-            return
+            maxDuration = sourceDuration
         }
+        let clamped = maxDuration > 0 ? min(max(position, 0), maxDuration) : max(position, 0)
+        let targetTime = CMTime(seconds: clamped, preferredTimescale: CMTimeScale(NSEC_PER_SEC))
 
-        // Clamp to valid range
-        let clampedProgress = min(max(progress, 0), maxDuration)
-        let targetTime = CMTime(seconds: clampedProgress, preferredTimescale: CMTimeScale(NSEC_PER_SEC))
-
-        // Use tolerant seeking for HLS (faster, more reliable)
+        // Tolerant seeking: lands on a nearby keyframe instead of decoding up to the exact frame
         let tolerance = CMTime(seconds: 1.0, preferredTimescale: CMTimeScale(NSEC_PER_SEC))
-        player?.seek(to: targetTime, toleranceBefore: tolerance, toleranceAfter: tolerance)
-        logger.info("⏭️ Seeking to \(Int(clampedProgress))s (max: \(Int(maxDuration))s)")
+        player.seek(to: targetTime, toleranceBefore: tolerance, toleranceAfter: tolerance) { finished in
+            DispatchQueue.main.async { completion?(finished) }
+        }
+        logger.info("⏭️ Seeking to \(Int(clamped))s")
     }
 
     func setVolume(_ volume: Float) {
@@ -284,6 +311,13 @@ class MediaPlayerController: NSObject, ObservableObject {
     /// Prevent system sleep during video playback
     private func preventSleep() {
         #if os(macOS)
+        if appNapActivity == nil {
+            appNapActivity = ProcessInfo.processInfo.beginActivity(
+                options: [.userInitiated, .idleSystemSleepDisabled],
+                reason: "LiquidCast streaming to AirPlay"
+            )
+        }
+
         guard !isSleepPrevented else { return }
 
         let reason = "LiquidCast video playback" as CFString
@@ -315,6 +349,11 @@ class MediaPlayerController: NSObject, ObservableObject {
     /// Allow system sleep when playback stops
     private func allowSleep() {
         #if os(macOS)
+        if let activity = appNapActivity {
+            ProcessInfo.processInfo.endActivity(activity)
+            appNapActivity = nil
+        }
+
         guard isSleepPrevented else { return }
 
         let result = IOPMAssertionRelease(sleepAssertionID)

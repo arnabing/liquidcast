@@ -46,64 +46,22 @@ struct CacheManager {
         return "\(baseName)_\(hashString)"
     }
 
-    /// Get the cached MP4 URL for an original file (if it exists)
-    static func cachedURL(for originalURL: URL) -> URL? {
-        let key = cacheKey(for: originalURL)
-        let cachedFile = cacheDirectory.appendingPathComponent("\(key).mp4")
-
-        if FileManager.default.fileExists(atPath: cachedFile.path) {
-            logger.info("Cache hit: \(cachedFile.lastPathComponent)")
-            return cachedFile
-        }
-
-        logger.info("Cache miss for: \(originalURL.lastPathComponent)")
-        return nil
+    /// Working directories of live HLS sessions (one subdirectory per session)
+    static var sessionsDirectory: URL {
+        cacheDirectory.appendingPathComponent("Sessions", isDirectory: true)
     }
 
-    /// Get the output URL for a new conversion (doesn't check existence)
-    static func outputURL(for originalURL: URL) -> URL {
-        let key = cacheKey(for: originalURL)
-        return cacheDirectory.appendingPathComponent("\(key).mp4")
-    }
-
-    /// Get a temporary URL for in-progress conversion
-    static func tempURL(for originalURL: URL) -> URL {
-        let key = cacheKey(for: originalURL)
-        return cacheDirectory.appendingPathComponent("\(key)_temp.mp4")
-    }
-
-    /// Get the HLS streaming directory for a file (contains playlist.m3u8 and segments)
-    static func hlsDirectory(for originalURL: URL) -> URL {
-        let key = cacheKey(for: originalURL)
-        return cacheDirectory.appendingPathComponent("\(key)_hls", isDirectory: true)
-    }
-
-    /// Remove a cached file and its HLS directory
-    static func removeCache(for originalURL: URL) {
-        let cachedFile = outputURL(for: originalURL)
-        let hlsDir = hlsDirectory(for: originalURL)
-
-        try? FileManager.default.removeItem(at: cachedFile)
-        try? FileManager.default.removeItem(at: hlsDir)
-        logger.info("Removed cache: \(cachedFile.lastPathComponent)")
-    }
-
-    /// Remove an HLS directory by its playlist URL
-    static func removeHLSCache(playlistURL: URL) {
-        // The playlist is inside the HLS directory, so get the parent
-        let hlsDir = playlistURL.deletingLastPathComponent()
-        do {
-            try FileManager.default.removeItem(at: hlsDir)
-            logger.info("Removed HLS cache: \(hlsDir.lastPathComponent)")
-        } catch {
-            logger.error("Failed to remove HLS cache: \(error.localizedDescription)")
-        }
+    /// Delete leftover session directories (call at launch: none can be live yet)
+    static func clearSessions() {
+        try? FileManager.default.removeItem(at: sessionsDirectory)
     }
 
     /// Clear all cached converted files
     static func clearAllCache() {
         do {
+            // Keep Sessions: it holds the segments of a stream that may be playing right now
             let contents = try FileManager.default.contentsOfDirectory(at: cacheDirectory, includingPropertiesForKeys: nil)
+                .filter { $0.lastPathComponent != sessionsDirectory.lastPathComponent }
             for file in contents {
                 try FileManager.default.removeItem(at: file)
             }

@@ -19,7 +19,7 @@ LiquidCast is a macOS app for casting any video format to Apple TV via AirPlay. 
 ### App Entry Point
 
 **`LiquidCastApp.swift`**
-- macOS: MiniPlayerView (320x120 window) + MenuBarExtra
+- macOS: MiniPlayerView (500x180 window) + MenuBarExtra
 - iOS: ContentView (full-size)
 - Menu bar shows play/pause status + AirPlay connection indicator
 
@@ -29,38 +29,35 @@ LiquidCast is a macOS app for casting any video format to Apple TV via AirPlay. 
 - Central `@MainActor` observable state
 - Orchestrates: MediaPlayerController, AirPlayManager, TranscodeManager
 - Persists: device name, compatibility mode, ultra quality setting
-- Auto-cleans cache at 80% playback progress
+- Saves playback position every 5s and resumes from it (cleared past 95%); seeks go straight to AVPlayer
 
-**TranscodeManager** (`Shared/Transcoder/TranscodeManager.swift`)
-- Base class with macOS-specific extension
-- 4 conversion paths:
+**TranscodeManager** (`Shared/Transcoder/TranscodeManager.swift` + `macOS/Transcoder/TranscodeManagerMacOS.swift`)
+- `prepareForAirPlay` returns the file URL (direct play: H.264+AAC in MP4/MOV) or an http:// HLS playlist
+- Owns the active `HLSSession` and the `LocalHTTPServer` (started once, kept for the app's lifetime)
 
-| Path | Trigger | Action |
-|------|---------|--------|
-| 0 | H.264+AAC in MP4/MOV | Direct playback (no conversion) |
-| 1 | H.264+AAC in MKV/AVI | Fast remux to MP4 |
-| 2 | H.264+DTS/AC3 | Copy video, transcode audio via HLS |
-| 3 | XviD/H.265/VP9/etc | Full transcode via HLS |
+**On-demand HLS** (`macOS/Transcoder/`) - read `docs/STREAMING.md` before changing anything here
+- `SegmentPlan`: all segment boundaries decided up front → complete VOD playlist (full duration, native seeking, resume via `EXT-X-START`)
+- `StreamProfile`: copy (8-bit H.264) or re-encode (VideoToolbox H.264); FFmpeg args for a job starting at any segment
+- `HLSSession`: serve finished segment / wait for the running job / restart FFmpeg at the requested segment; pauses FFmpeg when far ahead
+- `KeyframeIndex`: keyframe scan for stream copy (cached), and where an FFmpeg seek actually lands
+- `FFmpegProcess`: actor around the subprocess; never blocks (no `waitUntilExit`), SIGKILL/SIGSTOP, `killAll()` on quit
+- Restarted jobs must produce segments identical to a continuous run (timestamps pinned to media time, pre-roll discarded, explicit cut points). The invariants are subtle and each one fixed a real bug.
 
 **MediaAnalyzer** (`Shared/Utils/MediaAnalyzer.swift`)
-- Runs ffprobe to analyze video/audio codecs
-- Determines which conversion path to use
+- Runs ffprobe (via `ProcessRunner`) to analyze codecs, duration, container start time
+- Ignores cover-art "video" streams
 
 **LocalHTTPServer** (`Shared/HTTPServer/LocalHTTPServer.swift`)
-- Network.framework-based HTTP server
-- Serves HLS playlist + .ts segments on ports 8765-8775
-- Required because AirPlay needs http:// URLs
-
-**FFmpegProcess** (`macOS/Transcoder/FFmpegProcess.swift`)
-- Actor for managing FFmpeg subprocess
-- Handles process lifecycle and error output
+- Network.framework HTTP/1.1, off the main thread, async request handlers (a segment request can wait)
+- Routes `/<session>/playlist.m3u8` and `/<session>/<n>.ts`; ports 8765-8775, 9876-9885
+- Required because AirPlay needs http:// URLs reachable from the receiver
 
 ### UI Components
 
 **MiniPlayerView** (`macOS/Views/MiniPlayerView.swift`)
-- Compact 320x120 Winamp-style player
+- Compact 500x180 Winamp-style player
 - Shows: file name, progress bar, playback controls, AirPlay button
-- Status indicator: green (playing), yellow (paused), orange (converting)
+- Status indicator: green (playing), yellow (paused), orange (preparing)
 
 **MenuBarContentView** (in `LiquidCastApp.swift`)
 - Menu bar dropdown with playback controls
@@ -69,8 +66,9 @@ LiquidCast is a macOS app for casting any video format to Apple TV via AirPlay. 
 ### Settings
 
 **Ultra Quality** (`transcodeManager.ultraQualityAudio`)
-- OFF: 192kbps stereo AAC, standard video bitrates
-- ON: 320kbps 5.1 AAC, higher video bitrates (15-20 Mbps)
+- OFF: 192kbps stereo AAC, standard video bitrates (8 Mbps 1080p)
+- ON: 320kbps AAC keeping up to 5.1 (never upmixed), higher video bitrates (15 Mbps 1080p, 20 Mbps 4K)
+- Video peaks are capped at 1.5x the target (`-maxrate`) so Wi-Fi delivery doesn't stall
 
 **Compatibility Mode** (`appState.compatibilityMode`)
 - `.appleTV`: H.264 High profile allowed
@@ -102,9 +100,12 @@ LiquidCast/
 │   ├── Views/
 │   │   └── MiniPlayerView.swift      # Mini player UI
 │   └── Transcoder/
-│       ├── TranscodeManagerMacOS.swift
-│       ├── FFmpegProcess.swift
-│       └── HLSSegmentMonitor.swift
+│       ├── TranscodeManagerMacOS.swift  # analyze → direct play or HLS session
+│       ├── HLSSession.swift          # on-demand segment production
+│       ├── SegmentPlan.swift         # boundaries + VOD playlist
+│       ├── StreamProfile.swift       # FFmpeg arguments per job
+│       ├── KeyframeIndex.swift       # keyframe scan, seek landing probe
+│       └── FFmpegProcess.swift       # subprocess actor
 └── iOS/
     └── Transcoder/
         └── TranscodeManageriOS.swift # Stub (no FFmpeg on iOS)
@@ -118,10 +119,11 @@ LiquidCast/
 
 ## Common Tasks
 
-### Adding a new conversion path
-1. Update `MediaAnalyzer.swift` to detect the new format
-2. Add handling in `TranscodeManagerMacOS.swift`
+### Changing what gets copied vs re-encoded
+- `MediaAnalysis.conversionPath` (`MediaAnalyzer.swift`) decides; `StreamProfile.make` maps it to copy/encode
 
 ### Changing audio/video quality
-- Modify `calculateBitrate()` in TranscodeManagerMacOS.swift
-- Audio settings in `performHLSTranscode()` around line 208
+- `StreamProfile.bitrateKbps` and `StreamProfile.make`
+
+### Verifying streaming changes
+- Re-run the restart-alignment and AVPlayer checks described at the end of `docs/STREAMING.md`

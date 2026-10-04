@@ -23,6 +23,22 @@ class MediaPlayerController: NSObject, ObservableObject {
     var onBufferingChanged: ((Bool) -> Void)?
     /// The current item can't be played (e.g. the AirPlay receiver can't decode it)
     var onItemFailed: ((Error?) -> Void)?
+    /// Text subtitle options of the current item (HLS renditions or the file's own tracks); names in order
+    var onSubtitleOptionsChanged: (([String]) -> Void)?
+    /// The shown text subtitle option changed (by the app, the player's automatic choice, or the TV)
+    var onSubtitleSelectionChanged: ((Int?) -> Void)?
+
+    /// Which text subtitles to show when an item loads
+    enum SubtitleSelection: Equatable {
+        /// The player's own choice (system preferences, forced renditions)
+        case automatic
+        case off
+        case option(Int)
+    }
+
+    /// URL of the current item
+    private(set) var currentURL: URL?
+    private var legibleGroup: AVMediaSelectionGroup?
     var onProgressChanged: ((Double, Double) -> Void)?
     var onDurationChanged: ((Double) -> Void)?
 
@@ -153,7 +169,8 @@ class MediaPlayerController: NSObject, ObservableObject {
 
     /// - Parameter startTime: Position to seek to before playback starts (HLS streams carry
     ///   their own start position in the playlist, so pass 0 for those)
-    func loadMedia(from url: URL, startTime: Double = 0) {
+    /// - Parameter subtitles: Text subtitles to show once the item is ready
+    func loadMedia(from url: URL, startTime: Double = 0, subtitles: SubtitleSelection = .automatic) {
         logger.info("📂 Loading media from: \(url.absoluteString)")
         logger.info("📂 URL scheme: \(url.scheme ?? "nil")")
         logger.info("📂 Is file URL: \(url.isFileURL)")
@@ -185,6 +202,25 @@ class MediaPlayerController: NSObject, ObservableObject {
         let playerItem = AVPlayerItem(asset: asset)
         itemCancellables.removeAll()
         isReady = false
+        currentURL = url
+        legibleGroup = nil
+        onSubtitleOptionsChanged?([])
+        Task { @MainActor [weak self] in
+            // Subtitle choices come from the asset itself, so they work for streams and files alike
+            let group = try? await asset.loadMediaSelectionGroup(for: .legible)
+            guard let self, self.playerItem === playerItem else { return }
+            self.legibleGroup = group
+            if let group {
+                switch subtitles {
+                case .automatic: break
+                case .off: playerItem.select(nil, in: group)
+                case .option(let index) where index < group.options.count: playerItem.select(group.options[index], in: group)
+                case .option: break
+                }
+            }
+            self.onSubtitleOptionsChanged?(group?.options.map(\.displayName) ?? [])
+            self.onSubtitleSelectionChanged?(self.selectedSubtitleIndex)
+        }
 
         // Observe when ready to play
         var hasStarted = false
@@ -213,6 +249,12 @@ class MediaPlayerController: NSObject, ObservableObject {
                     break
                 }
             }
+            .store(in: &itemCancellables)
+
+        // Follow the shown subtitle, whoever changed it
+        playerItem.publisher(for: \.currentMediaSelection)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.onSubtitleSelectionChanged?(self?.selectedSubtitleIndex) }
             .store(in: &itemCancellables)
 
         // Fails mid-playback (after readyToPlay) are reported here rather than via status
@@ -250,6 +292,29 @@ class MediaPlayerController: NSObject, ObservableObject {
 
     // MARK: - Playback Control
 
+    /// Show text subtitle option `index` (as reported by `onSubtitleOptionsChanged`), or none
+    func selectSubtitle(at index: Int?) {
+        guard let item = playerItem, let group = legibleGroup else { return }
+        let option = index.flatMap { $0 < group.options.count ? group.options[$0] : nil }
+        item.select(option, in: group)
+    }
+
+    /// Index of the selected text subtitle option, if any
+    var selectedSubtitleIndex: Int? {
+        guard let item = playerItem, let group = legibleGroup,
+              let selected = item.currentMediaSelection.selectedMediaOption(in: group) else { return nil }
+        return group.options.firstIndex(of: selected)
+    }
+
+    /// Seconds of media loaded ahead of the playhead
+    var bufferedAhead: Double {
+        guard let item = playerItem else { return 0 }
+        let now = item.currentTime().seconds
+        let end = item.loadedTimeRanges.map(\.timeRangeValue).filter { $0.containsTime(item.currentTime()) }
+            .map { ($0.start + $0.duration).seconds }.max()
+        return max((end ?? now) - now, 0)
+    }
+
     /// Stop and drop the current item (e.g. while the next file is being prepared, so the old
     /// item's progress can't be attributed to the new file)
     func unload() {
@@ -258,6 +323,9 @@ class MediaPlayerController: NSObject, ObservableObject {
         player?.pause()
         player?.replaceCurrentItem(with: nil)
         playerItem = nil
+        currentURL = nil
+        legibleGroup = nil
+        onSubtitleOptionsChanged?([])
         isReady = false
         allowSleep()
     }

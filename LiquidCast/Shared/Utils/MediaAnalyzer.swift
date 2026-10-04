@@ -33,6 +33,9 @@ struct StreamInfo {
     var isDefault: Bool = false
     /// ISO 639 language tag, if any
     var language: String? = nil
+    var title: String? = nil
+    /// Marked forced (subtitles meant to always show, e.g. for foreign-language dialogue)
+    var isForced: Bool = false
 
     var isDolbyAudio: Bool { codecName.lowercased() == "ac3" || codecName.lowercased() == "eac3" }
 
@@ -80,6 +83,11 @@ struct MediaAnalysis {
     let fileSize: Int64
     let videoStreams: [StreamInfo]
     let audioStreams: [StreamInfo]
+    var subtitleStreams: [StreamInfo] = []
+
+    /// Subtitle streams that can be shown (text as renditions, bitmaps by burning in)
+    var subtitleTracks: [SubtitleTrack] { subtitleStreams.compactMap(SubtitleTrack.init(stream:)) }
+
     /// Average bitrate of the whole file (bits/s), if known
     var bitRate: Int? = nil
 
@@ -229,6 +237,61 @@ struct MediaAnalysis {
     }
 }
 
+/// A subtitle stream of the source
+struct SubtitleTrack: Sendable, Equatable, Hashable {
+    enum Kind: Sendable {
+        /// Text (SRT, ASS, WebVTT, mov_text, …): served as a WebVTT rendition the player can switch
+        case text
+        /// Bitmaps (PGS, VobSub, DVB): can only be shown by burning them into the video
+        case image
+    }
+
+    let streamIndex: Int
+    let kind: Kind
+    /// FFmpeg codec name ("subrip", "ass", "hdmv_pgs_subtitle", …)
+    let codec: String
+    let language: String?
+    let title: String?
+    let isDefault: Bool
+    let isForced: Bool
+
+    static let textCodecs: Set<String> = ["subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text", "subviewer", "microdvd"]
+    static let imageCodecs: Set<String> = ["hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle", "xsub"]
+
+    init?(stream: StreamInfo) {
+        let codec = stream.codecName.lowercased()
+        if Self.textCodecs.contains(codec) {
+            kind = .text
+        } else if Self.imageCodecs.contains(codec) {
+            kind = .image
+        } else {
+            return nil  // e.g. closed captions, teletext: not supported
+        }
+        streamIndex = stream.index
+        self.codec = codec
+        language = stream.language
+        title = stream.title
+        isDefault = stream.isDefault
+        isForced = stream.isForced
+    }
+
+    /// BCP 47 language for the HLS LANGUAGE attribute ("eng" → "en")
+    var languageTag: String? {
+        guard let language, language != "und" else { return nil }
+        return Locale(identifier: language).language.languageCode?.identifier ?? language
+    }
+
+    /// Human-readable, e.g. "English (SDH)", "French — Forced"
+    var displayName: String {
+        var name = languageTag.flatMap { Locale.current.localizedString(forLanguageCode: $0) } ?? "Track \(streamIndex)"
+        if let title, !title.isEmpty, title.lowercased() != name.lowercased() {
+            name += " (\(title))"
+        }
+        if isForced { name += " — Forced" }
+        return name
+    }
+}
+
 /// Analyzes media files using ffprobe
 enum MediaAnalyzer {
 
@@ -312,6 +375,7 @@ enum MediaAnalyzer {
         let streams = json["streams"] as? [[String: Any]] ?? []
         var videoStreams: [StreamInfo] = []
         var audioStreams: [StreamInfo] = []
+        var subtitleStreams: [StreamInfo] = []
 
         for stream in streams {
             let codecType = stream["codec_type"] as? String ?? ""
@@ -346,12 +410,15 @@ enum MediaAnalyzer {
                     ?? ((stream["tags"] as? [String: Any])?["BPS"] as? String).flatMap { Int($0) },
                 codecTag: (stream["codec_tag_string"] as? String).flatMap { $0.hasPrefix("[") ? nil : $0 },
                 isDefault: ((stream["disposition"] as? [String: Any])?["default"] as? Int) == 1,
-                language: (stream["tags"] as? [String: Any])?["language"] as? String
+                language: (stream["tags"] as? [String: Any])?["language"] as? String,
+                title: (stream["tags"] as? [String: Any])?["title"] as? String,
+                isForced: ((stream["disposition"] as? [String: Any])?["forced"] as? Int) == 1
             )
 
             switch codecType {
             case "video": videoStreams.append(info)
             case "audio": audioStreams.append(info)
+            case "subtitle": subtitleStreams.append(info)
             default: break
             }
         }
@@ -363,6 +430,7 @@ enum MediaAnalyzer {
             fileSize: fileSize,
             videoStreams: videoStreams,
             audioStreams: audioStreams,
+            subtitleStreams: subtitleStreams,
             bitRate: (format["bit_rate"] as? String).flatMap { Int($0) }
         )
     }
@@ -392,15 +460,20 @@ enum ProcessRunner {
         process.standardOutput = outputHandle
         process.standardError = FileHandle.nullDevice
 
-        let status: Int32 = try await withCheckedThrowingContinuation { continuation in
-            process.terminationHandler = { continuation.resume(returning: $0.terminationStatus) }
-            do {
-                try process.run()
-            } catch {
-                process.terminationHandler = nil
-                continuation.resume(throwing: error)
+        let status: Int32 = try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                process.terminationHandler = { continuation.resume(returning: $0.terminationStatus) }
+                do {
+                    try process.run()
+                } catch {
+                    process.terminationHandler = nil
+                    continuation.resume(throwing: error)
+                }
             }
+        } onCancel: {
+            process.terminate()  // The caller gave up: don't leave the tool running
         }
+        try Task.checkCancellation()
         guard status == 0 else { throw ProcessRunnerError.exited(status: status) }
         return try Data(contentsOf: outputURL)
         #else

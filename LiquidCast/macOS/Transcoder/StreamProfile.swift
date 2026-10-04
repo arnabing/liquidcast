@@ -30,9 +30,17 @@ struct StreamProfile {
     enum Video: Equatable {
         /// Stream-copy (boundaries must be source keyframes): H.264, or HEVC for capable receivers
         case copy
-        /// Re-encode with VideoToolbox H.264 (level chosen by the encoder from resolution and frame rate).
-        /// `toneMap`: the source is HDR, convert it to SDR (BT.709) instead of showing it washed out.
-        case encode(bitrateKbps: Int, profile: String, toneMap: Bool)
+        /// Re-encode with VideoToolbox H.264.
+        /// - level: H.264 level × 10 (e.g. 41), the smallest that fits (`H264Level.minimum`); set on the
+        ///   encoder and declared in the playlist, so both agree
+        /// - toneMap: the source is HDR, convert it to SDR (BT.709) instead of showing it washed out
+        case encode(bitrateKbps: Int, profile: H264Profile, level: Int, toneMap: Bool)
+    }
+
+    enum H264Profile: String {
+        case main, high
+
+        var profileIdc: Int { self == .high ? 100 : 77 }
     }
 
     enum SegmentFormat {
@@ -59,6 +67,8 @@ struct StreamProfile {
     /// Audio passed through untouched ("ac3"/"eac3", incl. Atmos in E-AC-3) instead of AAC. Copied
     /// audio also lines up exactly across restarts: same source frames, no encoder priming.
     var copiedAudioCodec: String? = nil
+    /// Bitmap subtitle stream (PGS/VobSub/DVB) to burn into the video; requires re-encoding
+    var burnInSubtitleIndex: Int? = nil
     /// Tone mapping only: scale to this size first (4K → 1080p keeps software tone mapping ~3.5× realtime)
     var toneMapSize: (width: Int, height: Int)? = nil
 
@@ -90,12 +100,15 @@ struct StreamProfile {
     ///     before the boundary.
     ///   - landing: Media time of the first video packet the demuxer delivers after `seek`
     ///     (`KeyframeIndex.seekLanding`)
+    /// - bitrateScale: Re-encode only: fraction of the target bitrate (adaptive bitrate steps down on
+    ///   slow networks; any job may use any scale, segments from different jobs still line up)
     func arguments(
         input: URL,
         plan: SegmentPlan,
         startIndex: Int,
         seek: Double,
         landing: Double,
+        bitrateScale: Double = 1,
         outputDirectory: URL,
         filePrefix: String,
         segmentListURL: URL
@@ -121,11 +134,36 @@ struct StreamProfile {
         args += ["-ss", Self.format(seek)]
         args += ["-i", input.path]
 
-        args += ["-map", "0:\(videoStreamIndex)"]
+        // Video filters (re-encode only): HDR → SDR tone mapping, then burned-in image subtitles
+        var videoFilters: [String] = []
+        if case .encode(_, _, _, true) = video {
+            // HDR (PQ/HLG) → SDR BT.709: linearize, map highlights (Hable), re-encode the transfer.
+            // Input primaries/matrix are stated (always BT.2020 for PQ/HLG): files often leave them
+            // untagged, and zscale then fails with "no path between colorspaces".
+            let scale = toneMapSize.map { "w=\($0.width):h=\($0.height):" } ?? ""
+            videoFilters.append("zscale=\(scale)t=linear:npl=100:pin=bt2020:min=bt2020nc:p=bt2020,format=gbrpf32le,"
+                                + "zscale=p=bt709,tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv")
+        }
+        if let burnInSubtitleIndex, case .encode = video {
+            // Bitmap subtitles drawn into the picture, their canvas scaled to the video's size
+            let base = videoFilters.isEmpty ? "null" : videoFilters.joined(separator: ",")
+            args += [
+                "-filter_complex",
+                "[0:\(videoStreamIndex)]\(base),format=yuv420p[base];[0:\(burnInSubtitleIndex)][base]scale2ref[sub][ref];"
+                    + "[ref][sub]overlay=eof_action=pass,format=nv12[video]",
+                "-map", "[video]",
+            ]
+        } else {
+            args += ["-map", "0:\(videoStreamIndex)"]
+            if !videoFilters.isEmpty {
+                args += ["-vf", (videoFilters + ["format=nv12"]).joined(separator: ",")]
+            }
+        }
         if let audioStreamIndex {
             args += ["-map", "0:\(audioStreamIndex)"]
         }
-        args += ["-sn", "-dn"]  // Subtitles aren't streamed (text subtitles can't go into MPEG-TS and would fail the job)
+        // Subtitle streams aren't muxed: text ones are served as WebVTT renditions, bitmap ones burned in
+        args += ["-sn", "-dn"]
 
         switch video {
         case .copy:
@@ -136,24 +174,18 @@ struct StreamProfile {
             if stripDolbyVision {
                 args += ["-bsf:v", "dovi_rpu=strip=1"]
             }
-        case .encode(let bitrateKbps, let profile, let toneMap):
+        case .encode(let topBitrateKbps, let profile, let level, let toneMap):
+            let bitrateKbps = Int(Double(topBitrateKbps) * bitrateScale)
             if toneMap {
-                // HDR (PQ/HLG) → SDR BT.709: linearize, map highlights (Hable), re-encode the transfer.
-                // Input primaries/matrix are stated (always BT.2020 for PQ/HLG): files often leave them
-                // untagged, and zscale then fails with "no path between colorspaces".
-                let scale = toneMapSize.map { "w=\($0.width):h=\($0.height):" } ?? ""
-                args += [
-                    "-vf", "zscale=\(scale)t=linear:npl=100:pin=bt2020:min=bt2020nc:p=bt2020,format=gbrpf32le,"
-                        + "zscale=p=bt709,tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=nv12",
-                    "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
-                ]
+                args += ["-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709"]
             }
             args += [
                 "-fps_mode", "passthrough",       // Keep source frame times (segment muxer would default to CFR)
                 "-enc_time_base", "1:90000",      // ...at full precision
                 "-c:v", "h264_videotoolbox",
                 "-pix_fmt", "nv12",  // 8-bit 4:2:0 (also converts 10-bit sources)
-                "-profile:v", profile,
+                "-profile:v", profile.rawValue,
+                "-level", String(format: "%.1f", Double(level) / 10),
                 "-b:v", "\(bitrateKbps)k",
                 "-maxrate", "\(bitrateKbps * 3 / 2)k",  // Cap peaks so Wi-Fi delivery doesn't stall
                 "-bufsize", "\(bitrateKbps * 2)k",
@@ -193,7 +225,11 @@ struct StreamProfile {
                 "-segment_time_delta", Self.format(cutTolerance),
             ]
         }
-        if segmentFormat == .fmp4 {
+        if segmentFormat == .mpegts {
+            // Write timestamps as given (media time + base). Otherwise the TS muxer adds its own delay
+            // (~1.4s), and subtitles (X-TIMESTAMP-MAP) would need to guess it.
+            args += ["-segment_format_options", "mpegts_copyts=1"]
+        } else {
             // delay_moov, not empty_moov: the moov must wait for the first packets, or the muxer can't
             // describe copied AC-3/E-AC-3 ("Cannot write moov atom before AC3 packets")
             args += ["-segment_format_options",
@@ -205,6 +241,12 @@ struct StreamProfile {
 
     private static func format(_ value: Double) -> String {
         String(format: "%.6f", value)
+    }
+
+    /// RFC 6381 codec of re-encoded video (copied video's comes from the stream itself)
+    var encodedVideoCodecString: String? {
+        guard case .encode(_, let profile, let level, _) = video else { return nil }
+        return String(format: "avc1.%02X00%02X", profile.profileIdc, level)
     }
 
     /// RFC 6381 codec of the streamed audio, for the multivariant playlist
@@ -223,15 +265,18 @@ extension StreamProfile {
     /// - Parameters:
     ///   - passthrough: What the receiver accepts untouched: HEVC/HDR video, AC-3/E-AC-3 audio
     ///   - forceEncode: Re-encode even if the video could be stream-copied
+    ///   - burnInSubtitle: Bitmap subtitle stream to draw into the video (forces re-encoding)
     /// - Returns: nil if the source has no usable video stream.
     static func make(
         for analysis: MediaAnalysis,
         mode: CompatibilityMode,
         ultraQuality: Bool,
         passthrough: Passthrough,
-        forceEncode: Bool = false
+        forceEncode requestedForceEncode: Bool = false,
+        burnInSubtitle: Int? = nil
     ) -> StreamProfile? {
         guard let video = analysis.primaryVideo else { return nil }
+        let forceEncode = requestedForceEncode || burnInSubtitle != nil
 
         let videoMode: Video
         var segmentFormat = SegmentFormat.mpegts
@@ -246,12 +291,23 @@ extension StreamProfile {
             case .videoTranscode:
                 let toneMap = analysis.videoRange != .sdr
                 // Software tone mapping at 4K barely keeps up; SDR receivers are mostly 1080p anyway
-                if toneMap, let width = video.width, let height = video.height, width > 1920 {
-                    toneMapSize = (1920, Int((Double(height) * 1920 / Double(width) / 2).rounded()) * 2)
+                // (Display size: FFmpeg rotates frames upright before the filters run)
+                if toneMap, let size = video.displaySize, max(size.width, size.height) > 1920 {
+                    let scale = 1920 / Double(max(size.width, size.height))
+                    toneMapSize = (Int((Double(size.width) * scale / 2).rounded()) * 2,
+                                   Int((Double(size.height) * scale / 2).rounded()) * 2)
                 }
+                let width = toneMapSize?.width ?? video.displaySize?.width ?? 1920
+                let height = toneMapSize?.height ?? video.displaySize?.height ?? 1080
+                let bitrate = bitrateKbps(width: max(width, height), ultraQuality: ultraQuality)
+                let profile: H264Profile = mode == .smartTV ? .main : .high
                 videoMode = .encode(
-                    bitrateKbps: bitrateKbps(width: toneMapSize?.width ?? video.width, ultraQuality: ultraQuality),
-                    profile: mode == .smartTV ? "main" : "high",
+                    bitrateKbps: bitrate,
+                    profile: profile,
+                    // Unknown frame rate: assume 60, so the declared level is never too low
+                    level: H264Level.minimum(width: width, height: height, frameRate: video.frameRate ?? 60,
+                                             peakBitrateKbps: bitrate * 3 / 2, bufferKbits: bitrate * 2,
+                                             profile: profile),
                     toneMap: toneMap
                 )
             }
@@ -260,12 +316,13 @@ extension StreamProfile {
         let audio = analysis.audioStream(preferDolby: passthrough.contains(.dolbyAudio))
         let copyAudio = passthrough.contains(.dolbyAudio) && audio?.isDolbyAudio == true
 
-        // Standard layouts only: mono, stereo, 5.1. Ultra keeps 5.1 (never upmixes); standard is stereo.
-        let sourceChannels = audio?.channels ?? 2
+        // Standard layouts only: mono, stereo, 5.1 (never upmixed). Surround is kept for an Apple TV, which
+        // downmixes to whatever its output is, and with Ultra; smart TVs otherwise get stereo.
+        let keepSurround = ultraQuality || mode == .appleTV
         let channels: Int
-        switch sourceChannels {
+        switch audio?.channels ?? 2 {
         case ...1: channels = 1
-        case 6...: channels = ultraQuality ? 6 : 2
+        case 6...: channels = keepSurround ? 6 : 2
         default: channels = 2
         }
         // Apple's HLS spec: AAC at 48kHz or below
@@ -275,12 +332,14 @@ extension StreamProfile {
             videoStreamIndex: video.index,
             audioStreamIndex: audio?.index,
             video: videoMode,
-            audioBitrateKbps: ultraQuality ? 320 : 192,
+            // AAC: ~192 kbps per stereo pair is transparent; 5.1 needs more than stereo's budget
+            audioBitrateKbps: channels >= 6 ? (ultraQuality ? 512 : 384) : (ultraQuality ? 320 : 192),
             audioChannels: channels,
             audioSampleRate: sampleRate,
             segmentFormat: segmentFormat,
             stripDolbyVision: segmentFormat == .fmp4 && video.dolbyVisionProfile != nil,
             copiedAudioCodec: copyAudio ? audio?.codecName.lowercased() : nil,
+            burnInSubtitleIndex: burnInSubtitle,
             toneMapSize: toneMapSize
         )
     }
@@ -298,5 +357,42 @@ extension StreamProfile {
         case (721..., false): return 4_000
         default: return 2_000
         }
+    }
+}
+
+/// H.264 levels (ITU-T H.264 Table A-1)
+enum H264Level {
+    private struct Limits {
+        let level: Int              // × 10
+        let maxFrameSize: Int       // macroblocks
+        let maxMacroblockRate: Int  // macroblocks/s
+        let maxBitrate: Int         // kbit/s for Baseline/Main; High allows × 1.25
+        let maxBuffer: Int          // CPB, kbit for Baseline/Main; High allows × 1.25
+    }
+
+    private static let table: [Limits] = [
+        Limits(level: 30, maxFrameSize: 1_620, maxMacroblockRate: 40_500, maxBitrate: 10_000, maxBuffer: 10_000),
+        Limits(level: 31, maxFrameSize: 3_600, maxMacroblockRate: 108_000, maxBitrate: 14_000, maxBuffer: 14_000),
+        Limits(level: 32, maxFrameSize: 5_120, maxMacroblockRate: 216_000, maxBitrate: 20_000, maxBuffer: 20_000),
+        Limits(level: 40, maxFrameSize: 8_192, maxMacroblockRate: 245_760, maxBitrate: 20_000, maxBuffer: 25_000),
+        Limits(level: 41, maxFrameSize: 8_192, maxMacroblockRate: 245_760, maxBitrate: 50_000, maxBuffer: 62_500),
+        Limits(level: 42, maxFrameSize: 8_704, maxMacroblockRate: 522_240, maxBitrate: 50_000, maxBuffer: 62_500),
+        Limits(level: 50, maxFrameSize: 22_080, maxMacroblockRate: 589_824, maxBitrate: 135_000, maxBuffer: 135_000),
+        Limits(level: 51, maxFrameSize: 36_864, maxMacroblockRate: 983_040, maxBitrate: 240_000, maxBuffer: 240_000),
+        Limits(level: 52, maxFrameSize: 36_864, maxMacroblockRate: 2_073_600, maxBitrate: 240_000, maxBuffer: 240_000),
+    ]
+
+    /// Smallest level that fits the frame size, macroblock rate, peak bitrate and decoder buffer
+    /// (5.2 if nothing does)
+    static func minimum(width: Int, height: Int, frameRate: Double, peakBitrateKbps: Int, bufferKbits: Int = 0,
+                        profile: StreamProfile.H264Profile) -> Int {
+        let frameSize = ((width + 15) / 16) * ((height + 15) / 16)
+        let macroblockRate = Int((Double(frameSize) * frameRate).rounded(.up))
+        let factor = profile == .high ? 1.25 : 1.0
+        return table.first {
+            frameSize <= $0.maxFrameSize && macroblockRate <= $0.maxMacroblockRate
+                && Double(peakBitrateKbps) <= Double($0.maxBitrate) * factor
+                && Double(bufferKbits) <= Double($0.maxBuffer) * factor
+        }?.level ?? 52
     }
 }

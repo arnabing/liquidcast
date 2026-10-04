@@ -16,7 +16,7 @@ private let logger = Logger(subsystem: "com.liquidcast", category: "Transcoder")
 extension TranscodeManager {
 
     func performPreparation(from url: URL, mode: CompatibilityMode, startPosition: Double,
-                            passthrough: Passthrough) async throws -> URL {
+                            passthrough: Passthrough, burnIn: SubtitleBurnIn) async throws -> URL {
         stopStreaming()
         let generation = preparationGeneration
 
@@ -34,6 +34,16 @@ extension TranscodeManager {
             let analysis = try await MediaAnalyzer.analyze(url: url, ffprobePath: ffprobePath)
             try ensureCurrent(generation)
             sourceDuration = analysis.duration ?? 0
+            subtitleTracks = analysis.subtitleTracks
+
+            // Explicit burn-in forces a re-encode; a forced track is only drawn if re-encoding anyway
+            var burnInStream: Int?
+            var forcedSubtitle: Int?
+            switch burnIn {
+            case .off: break
+            case .stream(let index): burnInStream = analysis.subtitleTracks.first { $0.streamIndex == index && $0.kind == .image }?.streamIndex
+            case .automatic: forcedSubtitle = analysis.subtitleTracks.first { $0.kind == .image && $0.isForced }?.streamIndex
+            }
 
             // A file the receiver plays as-is needs no FFmpeg at all
             var nativeNeeds: Passthrough = .nativeFile
@@ -41,7 +51,8 @@ extension TranscodeManager {
             if analysis.nativeFileNeedsDolbyAudio { nativeNeeds.insert(.dolbyAudio) }
             let nativeForReceiver = analysis.conversionPath != .directPlayback
                 && analysis.isAppleNativeFile && passthrough.isSuperset(of: nativeNeeds)
-            if analysis.conversionPath == .directPlayback || nativeForReceiver {
+            // (Burning in subtitles needs re-encoding, so never plays the file directly)
+            if burnInStream == nil && (analysis.conversionPath == .directPlayback || nativeForReceiver) {
                 logger.info("▶️ Direct playback: \(analysis.summary)")
                 passthroughUsed = nativeForReceiver ? nativeNeeds : []
                 updateStreamingInfo(analysis: analysis, profile: nil)
@@ -57,6 +68,7 @@ extension TranscodeManager {
 
             let (profile, plan, variant) = try await makeStream(
                 for: url, analysis: analysis, duration: duration, mode: mode, passthrough: passthrough,
+                burnInSubtitle: burnInStream, forcedSubtitle: forcedSubtitle,
                 ffmpegPath: ffmpegPath, ffprobePath: ffprobePath
             )
             try ensureCurrent(generation)
@@ -71,6 +83,7 @@ extension TranscodeManager {
                 plan: plan,
                 profile: profile,
                 variant: variant,
+                subtitles: analysis.subtitleTracks,
                 ffmpegPath: ffmpegPath,
                 rootDirectory: CacheManager.sessionsDirectory,
                 startTime: min(max(startPosition, 0), duration)
@@ -89,6 +102,7 @@ extension TranscodeManager {
 
             activeSession = session
             sessionRegistry.register(session)
+            burnedInSubtitle = profile.burnInSubtitleIndex
             passthroughUsed = []
             if profile.segmentFormat == .fmp4 { passthroughUsed.insert(.hevc) }
             if profile.copiedAudioCodec != nil { passthroughUsed.insert(.dolbyAudio) }
@@ -96,7 +110,7 @@ extension TranscodeManager {
             isStreaming = true
             finishPreparation(status: "Streaming")
 
-            let playlistURL = baseURL.appendingPathComponent(session.id).appendingPathComponent("playlist.m3u8")
+            let playlistURL = Self.playlistURL(base: baseURL, session: session, startTime: startPosition)
             logger.info("📺 Streaming \(url.lastPathComponent) at \(playlistURL.absoluteString)")
             return playlistURL
 
@@ -109,25 +123,72 @@ extension TranscodeManager {
         }
     }
 
+    /// The active stream's playlist URL at the Mac's *current* address (it changes when the network
+    /// does; the session and its port don't)
+    func currentPlaylistURL(startTime: Double = 0) -> URL? {
+        // No LAN address (network down): nothing a receiver could reach, keep the current URL
+        guard let session = activeSession, LocalNetwork.primaryIPv4Address() != nil,
+              let baseURL = httpServer.baseURL else { return nil }
+        return Self.playlistURL(base: baseURL, session: session, startTime: startTime)
+    }
+
+    /// `<base>/<session>/playlist.m3u8[?start=<seconds>]`: the start goes into EXT-X-START
+    private static func playlistURL(base: URL, session: HLSSession, startTime: Double) -> URL {
+        let url = base.appendingPathComponent(session.id).appendingPathComponent("playlist.m3u8")
+        guard startTime > 0, var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return url }
+        components.queryItems = [URLQueryItem(name: "start", value: String(format: "%.3f", startTime))]
+        return components.url ?? url
+    }
+
+    /// Segments fully delivered to the receiver beyond the one containing `position` (nil: not streaming).
+    /// If it has them yet doesn't play, the problem isn't supply.
+    func segmentsDeliveredAhead(of position: Double) async -> Int? {
+        guard let session = activeSession else { return nil }
+        return await session.deliveredAhead(of: session.plan.index(containing: position))
+    }
+
     // MARK: - HTTP routing
 
     /// Routes, per session:
-    /// - `playlist.m3u8`: entry point (multivariant for fMP4, else the media playlist)
+    /// - `playlist.m3u8`: multivariant playlist (entry point)
+    /// - `subs/<stream>/index.m3u8`, `subs/<stream>/<index>.vtt`: text subtitle renditions
     /// - `media.m3u8`: media playlist
     /// - `init.mp4`: fMP4 init segment
     /// - `<index>.ts` / `<index>.m4s`: segments, produced on demand
     nonisolated static func makeRequestHandler(registry: HLSSessionRegistry) -> LocalHTTPServer.Handler {
         return { request in
-            let parts = request.path.split(separator: "/")
-            guard parts.count == 2, let session = registry.session(id: String(parts[0])) else {
+            let parts = request.path.split(separator: "/").map(String.init)
+            guard parts.count >= 2, let session = registry.session(id: parts[0]) else {
                 return .error(404)
             }
-            let name = String(parts[1])
             let playlistType = "application/vnd.apple.mpegurl"
+
+            // Subtitles: subs/<stream>/index.m3u8 and subs/<stream>/<index>.vtt
+            if parts[1] == "subs" {
+                guard parts.count == 4, let stream = Int(parts[2]) else { return .error(404) }
+                if parts[3] == "index.m3u8" {
+                    guard session.subtitleTracks.contains(where: { $0.streamIndex == stream }) else { return .error(404) }
+                    await session.prefetchSubtitles(streamIndex: stream)
+                    return .ok(Data(session.subtitlePlaylist.utf8), contentType: playlistType)
+                }
+                guard parts[3].hasSuffix(".vtt"), let index = Int(parts[3].dropLast(4)) else {
+                    return .error(404)
+                }
+                do {
+                    let vtt = try await session.subtitleSegment(streamIndex: stream, index: index)
+                    return .ok(Data(vtt.utf8), contentType: "text/vtt")
+                } catch {
+                    return response(for: error, what: "subtitle segment \(index)")
+                }
+            }
+
+            guard parts.count == 2 else { return .error(404) }
+            let name = parts[1]
 
             switch name {
             case "playlist.m3u8":
-                return .ok(Data(session.entryPlaylist.utf8), contentType: playlistType)
+                let start = request.query["start"].flatMap(Double.init) ?? 0
+                return .ok(Data(session.masterPlaylist(startTime: start).utf8), contentType: playlistType)
             case HLSSession.mediaPlaylistName:
                 return .ok(Data(session.mediaPlaylist.utf8), contentType: playlistType)
             default:
@@ -157,7 +218,11 @@ extension TranscodeManager {
                 let file = try await session.segment(index)
                 let data = try Data(contentsOf: file, options: .alwaysMapped)
                 let body = format == .fmp4 ? MP4Segment.mediaSection(of: data) : data
-                return .ok(body, contentType: format.contentType)
+                // Waiting past 3× the segment's duration is already "far too slow" for adaptive bitrate
+                let deadline = max(session.plan.duration(of: index), 1) * 3
+                return .ok(body, contentType: format.contentType, deliveryDeadline: deadline) { seconds in
+                    Task { await session.recordDelivery(index: index, seconds: seconds) }
+                }
             } catch {
                 return response(for: error, what: "segment \(index)")
             }
@@ -179,58 +244,25 @@ extension TranscodeManager {
 
     // MARK: - Helpers
 
-    /// Choose how to encode, the segment layout that goes with it, and (fMP4) the variant description
+    /// Choose how to encode, the segment layout that goes with it, and the variant description
     private func makeStream(
         for url: URL,
         analysis: MediaAnalysis,
         duration: Double,
         mode: CompatibilityMode,
         passthrough: Passthrough,
+        burnInSubtitle: Int?,
+        forcedSubtitle: Int?,
         ffmpegPath: String,
         ffprobePath: String
-    ) async throws -> (StreamProfile, SegmentPlan, HLSVariant?) {
-        guard var profile = StreamProfile.make(for: analysis, mode: mode, ultraQuality: ultraQualityAudio,
-                                               passthrough: passthrough) else {
+    ) async throws -> (StreamProfile, SegmentPlan, HLSVariant) {
+        guard let profile = StreamProfile.make(for: analysis, mode: mode, ultraQuality: ultraQualityAudio,
+                                               passthrough: passthrough, burnInSubtitle: burnInSubtitle) else {
             throw TranscodeError.conversionFailed("No video stream found")
         }
 
-        // HEVC passthrough needs the exact codec string for the multivariant playlist
-        var variant: HLSVariant?
-        if profile.segmentFormat == .fmp4 {
-            if let codec = await hevcCodecString(for: url, videoStreamIndex: profile.videoStreamIndex,
-                                                 ffmpegPath: ffmpegPath) {
-                let video = analysis.primaryVideo
-                // What's actually streamed: the copied video plus one audio track (the file's total
-                // includes every audio track, e.g. TrueHD and other languages)
-                let videoBitRate = video?.bitRate
-                    ?? analysis.bitRate
-                    ?? Int(Double(analysis.fileSize) * 8 / max(duration, 1))
-                let streamedAudio = analysis.audioStreams.first { $0.index == profile.audioStreamIndex }
-                let audioBitRate = profile.copiedAudioCodec != nil
-                    ? (streamedAudio?.bitRate ?? 768_000)  // Atmos E-AC-3 is usually 768 kbps
-                    : profile.audioBitrateKbps * 1000
-                let average = videoBitRate + (profile.audioStreamIndex != nil ? audioBitRate : 0)
-                variant = HLSVariant(
-                    codecs: [codec] + [profile.audioCodecString].compactMap { $0 },
-                    averageBandwidth: average,
-                    peakBandwidth: average * 2,  // Apple's VOD allowance: peak ≤ 200% of average
-                    width: video?.displaySize?.width,
-                    height: video?.displaySize?.height,
-                    frameRate: video?.frameRate,
-                    videoRange: analysis.videoRange
-                )
-            } else {
-                logger.warning("Couldn't read the HEVC codec configuration - re-encoding to H.264 instead")
-                guard let fallback = StreamProfile.make(for: analysis, mode: mode, ultraQuality: ultraQualityAudio,
-                                                        passthrough: passthrough, forceEncode: true) else {
-                    throw TranscodeError.conversionFailed("No video stream found")
-                }
-                profile = fallback
-            }
-        }
-
         if profile.video == .copy {
-            // Copied video can only be cut at its own keyframes
+            // Copied video can only be cut at its own keyframes, and is declared with its own codec string
             statusMessage = "Indexing..."
             do {
                 let keyframes = try await KeyframeIndex.keyframes(
@@ -239,41 +271,87 @@ extension TranscodeManager {
                     startTime: analysis.startTime,
                     ffprobePath: ffprobePath
                 )
-                if let plan = SegmentPlan.keyframeAligned(keyframes: keyframes, duration: duration,
+                let codec = await copiedVideoCodecString(for: url, profile: profile, ffmpegPath: ffmpegPath)
+                if let codec,
+                   let plan = SegmentPlan.keyframeAligned(keyframes: keyframes, duration: duration,
                                                           targetLength: StreamProfile.segmentLength),
                    plan.longestSegment <= StreamProfile.maxCopySegmentLength {
-                    logger.info("📦 Stream copy (\(profile.segmentFormat == .fmp4 ? "HEVC fMP4" : "MPEG-TS")): \(plan.count) segments from \(keyframes.count) keyframes")
-                    return (profile, plan, variant)
+                    logger.info("📦 Stream copy (\(profile.segmentFormat == .fmp4 ? "fMP4" : "MPEG-TS"), \(codec)): \(plan.count) segments from \(keyframes.count) keyframes")
+                    return (profile, plan, variant(for: profile, videoCodec: codec, analysis: analysis, duration: duration))
                 }
-                // Keyframes too sparse: huge segments mean slow starts and seeks
-                logger.warning("Keyframes unusable for segmenting (\(keyframes.count) found) - re-encoding instead")
+                // Keyframes too sparse (huge segments mean slow starts and seeks) or unreadable codec configuration
+                logger.warning("Can't stream-copy (\(keyframes.count) keyframes, codec \(codec ?? "unknown")) - re-encoding instead")
             } catch {
                 logger.warning("Keyframe scan failed (\(error.localizedDescription)) - re-encoding instead")
             }
         }
 
+        // Re-encoding anyway: a forced bitmap track comes along for free
         guard let encodeProfile = StreamProfile.make(for: analysis, mode: mode, ultraQuality: ultraQualityAudio,
-                                                     passthrough: passthrough, forceEncode: true),
+                                                     passthrough: passthrough, forceEncode: true,
+                                                     burnInSubtitle: burnInSubtitle ?? forcedSubtitle),
+              let codec = encodeProfile.encodedVideoCodecString,
               let plan = SegmentPlan.uniform(duration: duration, segmentLength: StreamProfile.segmentLength) else {
             throw TranscodeError.conversionFailed("Invalid duration")
         }
-        logger.info("🎬 Transcode: \(plan.count) segments")
-        return (encodeProfile, plan, nil)
+        logger.info("🎬 Transcode (\(codec)): \(plan.count) segments")
+        return (encodeProfile, plan, variant(for: encodeProfile, videoCodec: codec, analysis: analysis, duration: duration))
     }
 
-    /// RFC 6381 codec string of the source's HEVC stream, read from the `hvcC` box FFmpeg writes when
-    /// it copies the stream into MP4 (the same box the segments' init will carry). ~50ms.
-    private func hevcCodecString(for url: URL, videoStreamIndex: Int, ffmpegPath: String) async -> String? {
+    /// The stream as the multivariant playlist describes it
+    private func variant(for profile: StreamProfile, videoCodec: String, analysis: MediaAnalysis,
+                         duration: Double) -> HLSVariant {
+        let video = analysis.primaryVideo
+        let streamedAudio = analysis.audioStreams.first { $0.index == profile.audioStreamIndex }
+        let audioBitRate: Int
+        if profile.audioStreamIndex == nil {
+            audioBitRate = 0
+        } else if profile.copiedAudioCodec != nil {
+            audioBitRate = streamedAudio?.bitRate ?? 768_000  // Atmos E-AC-3 is usually 768 kbps
+        } else {
+            audioBitRate = profile.audioBitrateKbps * 1000
+        }
+
+        let average: Int, peak: Int
+        switch profile.video {
+        case .copy:
+            // The copied video plus one audio track (the file's total includes every audio track)
+            let videoBitRate = video?.bitRate ?? analysis.bitRate ?? Int(Double(analysis.fileSize) * 8 / max(duration, 1))
+            average = videoBitRate + audioBitRate
+            peak = average * 2  // Apple's VOD allowance: peak ≤ 200% of average
+        case .encode(let bitrateKbps, _, _, _):
+            average = bitrateKbps * 1000 + audioBitRate
+            peak = bitrateKbps * 1500 + audioBitRate  // -maxrate
+        }
+
+        let size = profile.toneMapSize ?? video?.displaySize
+        let range: VideoRange = profile.video == .copy ? analysis.videoRange : .sdr
+        return HLSVariant(
+            codecs: [videoCodec] + [profile.audioCodecString].compactMap { $0 },
+            averageBandwidth: average,
+            peakBandwidth: peak,
+            width: size?.width,
+            height: size?.height,
+            frameRate: video?.frameRate,
+            videoRange: range
+        )
+    }
+
+    /// RFC 6381 codec string of copied video, read from the `avcC`/`hvcC` box FFmpeg writes when it
+    /// copies the stream into MP4 (the same configuration the segments carry). ~50ms.
+    private func copiedVideoCodecString(for url: URL, profile: StreamProfile, ffmpegPath: String) async -> String? {
+        let isHEVC = profile.segmentFormat == .fmp4
         let output = try? await ProcessRunner.output(of: ffmpegPath, arguments: [
             "-hide_banner", "-nostdin", "-loglevel", "error",
             "-i", url.path,
-            "-map", "0:\(videoStreamIndex)",
-            "-c:v", "copy", "-tag:v", "hvc1",
+            "-map", "0:\(profile.videoStreamIndex)",
+            "-c:v", "copy"] + (isHEVC ? ["-tag:v", "hvc1"] : []) + [
             "-frames:v", "1",
             "-f", "mp4", "-movflags", "+frag_keyframe+empty_moov",
             "-"
         ])
-        return output.flatMap(MP4Segment.hevcCodecString)
+        guard let output else { return nil }
+        return isHEVC ? MP4Segment.hevcCodecString(in: output) : MP4Segment.avcCodecString(in: output)
     }
 
     private func ensureCurrent(_ generation: Int) throws {

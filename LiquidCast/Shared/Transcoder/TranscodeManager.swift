@@ -51,6 +51,16 @@ struct Passthrough: OptionSet, Hashable {
     }
 }
 
+/// Whether to draw a bitmap subtitle track (PGS/VobSub/DVB) into the video
+enum SubtitleBurnIn: Equatable {
+    /// A bitmap track the file marks forced (meant to always show, e.g. translated signs), but only when
+    /// the video is re-encoded anyway: it never costs passthrough (HEVC/HDR) on its own
+    case automatic
+    case off
+    /// This subtitle stream (ffprobe index)
+    case stream(Int)
+}
+
 /// Turns a media file into something AirPlay can play: the file itself, or an on-demand HLS stream.
 /// The actual implementation is in platform-specific extensions.
 @MainActor
@@ -70,6 +80,10 @@ class TranscodeManager: ObservableObject {
     @Published var outputAudioCodec: String = ""     // "AAC"
     @Published var outputAudioChannels: String = ""  // "5.1" or "Stereo"
     @Published var sourceDuration: Double = 0        // Full source file duration from ffprobe
+    /// Subtitle tracks of the current file (text: selectable renditions; image: burn-in)
+    @Published var subtitleTracks: [SubtitleTrack] = []
+    /// Bitmap subtitle stream burned into the current stream, if any
+    @Published var burnedInSubtitle: Int?
 
     /// What the current playback passes through untouched. If it fails, `AppState` retries without
     /// the most likely culprit.
@@ -97,15 +111,23 @@ class TranscodeManager: ObservableObject {
     ///     for a returned file URL the caller seeks.
     ///   - passthrough: What the receiver accepts untouched (Apple TV: HEVC/HDR, Dolby audio, native files)
     /// - Returns: The file URL itself (directly playable) or an http:// HLS playlist URL
+    ///   - burnIn: Bitmap subtitles to draw into the video
     func prepareForAirPlay(from url: URL, mode: CompatibilityMode = .appleTV, startPosition: Double = 0,
-                           passthrough: Passthrough = []) async throws -> URL {
+                           passthrough: Passthrough = [], burnIn: SubtitleBurnIn = .automatic) async throws -> URL {
         logger.info("🔄 Preparing \(url.lastPathComponent) (mode: \(mode.rawValue), start: \(Int(startPosition))s, passthrough: \(passthrough.rawValue))")
-        return try await performPreparation(from: url, mode: mode, startPosition: startPosition, passthrough: passthrough)
+        return try await performPreparation(from: url, mode: mode, startPosition: startPosition,
+                                            passthrough: passthrough, burnIn: burnIn)
     }
+
+    #if !os(macOS)
+    func currentPlaylistURL(startTime: Double = 0) -> URL? { nil }
+    func segmentsDeliveredAhead(of position: Double) async -> Int? { nil }
+    #endif
 
     /// Stop the current stream (kills FFmpeg, deletes its segments)
     func stopStreaming() {
         passthroughUsed = []
+        burnedInSubtitle = nil
         #if os(macOS)
         preparationGeneration += 1
         if let session = activeSession {

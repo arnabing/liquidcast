@@ -140,6 +140,15 @@ enum MP4Segment {
         }
     }
 
+    /// RFC 6381 codec string for the H.264 track (e.g. `avc1.640028`), from the `avcC` box:
+    /// profile, constraint flags and level bytes
+    static func avcCodecString(in data: Data) -> String? {
+        guard let marker = data.range(of: Data("avcC".utf8)) else { return nil }
+        let config = marker.upperBound
+        guard config + 4 <= data.endIndex else { return nil }
+        return String(format: "avc1.%02X%02X%02X", data[config + 1], data[config + 2], data[config + 3])
+    }
+
     /// RFC 6381 codec string for the HEVC track (e.g. `hvc1.2.4.L150.90`), from the `hvcC` box
     /// (ISO/IEC 14496-15 Annex E)
     static func hevcCodecString(in data: Data) -> String? {

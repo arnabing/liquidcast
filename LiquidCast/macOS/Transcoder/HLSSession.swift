@@ -52,14 +52,14 @@ actor HLSSession {
     nonisolated let segmentFormat: StreamProfile.SegmentFormat
     /// Complete VOD media playlist (immutable for the session)
     nonisolated let mediaPlaylist: String
-    /// Multivariant playlist pointing at `mediaPlaylistName` (fMP4/HEVC streams, which need CODECS
-    /// and VIDEO-RANGE declared); nil when the media playlist is served directly
-    nonisolated let masterPlaylist: String?
+    /// The variant and its subtitle renditions, for the multivariant playlist (`masterPlaylist(startTime:)`)
+    nonisolated let variant: HLSVariant
     nonisolated static let mediaPlaylistName = "media.m3u8"
     nonisolated static let initSegmentName = "init.mp4"
-
-    /// What the player is given first
-    nonisolated var entryPlaylist: String { masterPlaylist ?? mediaPlaylist }
+    /// Text subtitles served as WebVTT renditions (`subs/<stream>/index.m3u8`)
+    nonisolated let subtitleTracks: [SubtitleTrack]
+    /// Media playlist of every subtitle rendition (same segmentation as the video)
+    nonisolated let subtitlePlaylist: String
 
     private let source: URL
     private let sourceStartTime: Double
@@ -104,14 +104,25 @@ actor HLSSession {
     private var isStopped = false
     /// fMP4: the shared init segment, cut from the first segment file
     private var initSegmentData: Data?
+    private var subtitleCues: [SubtitleWindow: [WebVTT.Cue]] = [:]
+    private var subtitleExtractions: [SubtitleWindow: Task<[WebVTT.Cue], Error>] = [:]
+    private var bitrateRung = 0
+    private var lastRungChange = Date.distantPast
+    private var recentDeliveryRatios: [Double] = []
+    /// First segment produced at the current rung
+    private var rungChangeIndex = 0
+    private var highestDeliveredIndex = -1
 
-    /// - Parameter variant: fMP4 only: describes the stream for the multivariant playlist
+    /// - Parameters:
+    ///   - variant: Describes the stream for the multivariant playlist
+    ///   - subtitles: Text subtitle tracks to offer as renditions
     init(
         source: URL,
         sourceStartTime: Double,
         plan: SegmentPlan,
         profile: StreamProfile,
-        variant: HLSVariant?,
+        variant: HLSVariant,
+        subtitles: [SubtitleTrack],
         ffmpegPath: String,
         rootDirectory: URL,
         startTime: Double
@@ -121,12 +132,15 @@ actor HLSSession {
         self.plan = plan
         self.segmentFormat = profile.segmentFormat
         let isFMP4 = profile.segmentFormat == .fmp4
+        // The start position lives in the multivariant playlist, which is made per request
         self.mediaPlaylist = plan.playlist(
-            startTime: startTime,
             segmentExtension: profile.segmentFormat.urlExtension,
             initURI: isFMP4 ? Self.initSegmentName : nil
         )
-        self.masterPlaylist = isFMP4 ? variant?.masterPlaylist(mediaURI: Self.mediaPlaylistName) : nil
+        let textTracks = subtitles.filter { $0.kind == .text }
+        self.subtitleTracks = textTracks
+        self.subtitlePlaylist = WebVTT.playlist(plan: plan)
+        self.variant = variant
         self.source = source
         self.sourceStartTime = sourceStartTime
         self.profile = profile
@@ -161,6 +175,8 @@ actor HLSSession {
         }
         job = nil
         failAllWaiters(SessionError.stopped)
+        for extraction in subtitleExtractions.values { extraction.cancel() }  // Kills their FFmpeg
+        subtitleExtractions = [:]
         try? FileManager.default.removeItem(at: directory)
         logger.info("[\(self.id.prefix(8))] Session stopped")
     }
@@ -216,6 +232,129 @@ actor HLSSession {
         throw SessionError.timedOut
     }
 
+    /// Multivariant playlist (the entry point), starting playback at `startTime`
+    nonisolated func masterPlaylist(startTime: Double) -> String {
+        variant.masterPlaylist(
+            mediaURI: Self.mediaPlaylistName,
+            // Playlist in a folder of its own, so its relative segment URIs ("<n>.vtt") resolve beside it
+            subtitles: subtitleTracks.map { ($0, "subs/\($0.streamIndex)/index.m3u8") },
+            startTime: min(max(startTime, 0), plan.duration)
+        )
+    }
+
+    // MARK: - Subtitles
+
+    private struct SubtitleWindow: Hashable {
+        let streamIndex: Int
+        let window: Int
+    }
+
+    /// WebVTT segment `index` of text subtitle stream `streamIndex`. Cues come from the extraction
+    /// windows the segment overlaps; concurrent requests share an extraction.
+    func subtitleSegment(streamIndex: Int, index: Int) async throws -> String {
+        guard let track = subtitleTracks.first(where: { $0.streamIndex == streamIndex }),
+              index >= 0 && index < plan.count else { throw SessionError.notFound }
+        var cues = Set<WebVTT.Cue>()
+        for window in WebVTT.windows(for: index, of: plan) {
+            cues.formUnion(try await subtitleCues(track, window: window))
+        }
+        // The player usually walks on: have the next window ready
+        let ahead = (WebVTT.windows(for: index, of: plan).upperBound) + 1
+        if Double(ahead) * WebVTT.window < plan.duration {
+            prefetchSubtitles(track, window: ahead)
+        }
+        return WebVTT.segment(index, of: plan, cues: Array(cues))
+    }
+
+    /// Start extracting the window around `position` for every text track (called when a subtitle
+    /// playlist is requested, so the first segments don't wait)
+    func prefetchSubtitles(streamIndex: Int) {
+        guard let track = subtitleTracks.first(where: { $0.streamIndex == streamIndex }) else { return }
+        prefetchSubtitles(track, window: Int(plan.start(of: lastRequestedIndex) / WebVTT.window))
+    }
+
+    private func prefetchSubtitles(_ track: SubtitleTrack, window: Int) {
+        Task { _ = try? await self.subtitleCues(track, window: window) }
+    }
+
+    private func subtitleCues(_ track: SubtitleTrack, window: Int) async throws -> [WebVTT.Cue] {
+        guard !isStopped else { throw SessionError.stopped }
+        let key = SubtitleWindow(streamIndex: track.streamIndex, window: window)
+        if let cached = subtitleCues[key] { return cached }
+        let extraction = subtitleExtractions[key] ?? Task { [source, ffmpegPath] in
+            try await WebVTT.cues(for: source, streamIndex: track.streamIndex, codec: track.codec,
+                                  windowIndex: window, ffmpegPath: ffmpegPath)
+        }
+        subtitleExtractions[key] = extraction
+        do {
+            let cues = try await extraction.value
+            subtitleCues[key] = cues
+            if subtitleExtractions[key] == extraction { subtitleExtractions[key] = nil }
+            return cues
+        } catch {
+            // Only clear our own entry: a newer retry may already be running
+            if subtitleExtractions[key] == extraction { subtitleExtractions[key] = nil }
+            throw SessionError.transcodeFailed("Subtitle extraction failed: \(error.localizedDescription)")
+        }
+    }
+
+    // MARK: - Adaptive bitrate (re-encoded streams)
+
+    /// Fractions of the target bitrate. Any job can use any rung: segments still line up.
+    static let bitrateLadder: [Double] = [1.0, 0.6, 0.35]
+    /// Delivery taking longer than this fraction of the segment's duration means the network can't
+    /// keep up (two in a row: step down)...
+    static let slowDelivery = 0.8
+    /// ...and this little of it means plenty of headroom (five in a row, 30s after a change: step up)
+    static let fastDelivery = 0.3
+
+    /// How long the receiver took to download segment `index` (until it had every byte)
+    func recordDelivery(index: Int, seconds: Double) {
+        guard index >= 0, index < plan.count else { return }
+        highestDeliveredIndex = max(highestDeliveredIndex, index)
+        // Only re-encoded video can change bitrate; segments made before the last change say nothing
+        // about the current rate
+        guard case .encode = profile.video, index >= rungChangeIndex else { return }
+        let ratio = seconds / max(plan.duration(of: index), 0.5)
+        recentDeliveryRatios = Array((recentDeliveryRatios + [ratio]).suffix(5))
+
+        let sinceChange = Date().timeIntervalSince(lastRungChange)
+        if recentDeliveryRatios.suffix(2).count == 2, recentDeliveryRatios.suffix(2).allSatisfy({ $0 > Self.slowDelivery }),
+           bitrateRung + 1 < Self.bitrateLadder.count {
+            changeBitrateRung(to: bitrateRung + 1, reason: String(format: "delivery at %.0f%% of realtime", ratio * 100))
+        } else if recentDeliveryRatios.count == 5, recentDeliveryRatios.allSatisfy({ $0 < Self.fastDelivery }),
+                  bitrateRung > 0, sinceChange > 30 {
+            changeBitrateRung(to: bitrateRung - 1, reason: "network has headroom")
+        }
+    }
+
+    /// Current fraction of the target bitrate (for tests and diagnostics)
+    var currentBitrateScale: Double { Self.bitrateLadder[bitrateRung] }
+
+    /// Continue at another bitrate from the first segment the player doesn't have yet. Segments already
+    /// made beyond it (at the old rate) are dropped, so the change takes effect now, not minutes later.
+    private func changeBitrateRung(to rung: Int, reason: String) {
+        bitrateRung = rung
+        lastRungChange = Date()
+        recentDeliveryRatios = []
+        logger.info("[\(self.id.prefix(8))] Bitrate → \(Int(Self.bitrateLadder[rung] * 100))% (\(reason))")
+
+        // A requested segment that isn't made yet is produced by the new job (its request stays covered)
+        let next = segments[lastRequestedIndex] == nil ? lastRequestedIndex : lastRequestedIndex + 1
+        rungChangeIndex = next
+        guard next < producibleEnd else { return }
+        for (index, url) in segments where index >= next {
+            try? FileManager.default.removeItem(at: url)
+            segments[index] = nil
+        }
+        Task { try? await self.startJob(at: next) }
+    }
+
+    /// Segments fully delivered beyond `index` (how far ahead the player has the data)
+    func deliveredAhead(of index: Int) -> Int {
+        highestDeliveredIndex - index
+    }
+
     /// Whether the running job will produce `index` soon
     private func isCovered(_ index: Int) -> Bool {
         guard let job else { return false }
@@ -253,6 +392,7 @@ actor HLSSession {
                 startIndex: index,
                 seek: seek,
                 landing: landing,
+                bitrateScale: Self.bitrateLadder[bitrateRung],
                 outputDirectory: directory,
                 filePrefix: newJob.filePrefix,
                 segmentListURL: newJob.listURL

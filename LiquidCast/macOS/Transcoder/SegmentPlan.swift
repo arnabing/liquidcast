@@ -101,8 +101,8 @@ struct SegmentPlan: Equatable {
     }
 }
 
-/// The one variant of a stream, described in a multivariant ("master") playlist. Needed for HEVC/HDR:
-/// receivers learn the codec and dynamic range from it (CODECS, VIDEO-RANGE) before downloading.
+/// The one variant of a stream, described in a multivariant ("master") playlist: receivers learn the
+/// codec and dynamic range (CODECS, VIDEO-RANGE) before downloading, and find subtitle renditions.
 struct HLSVariant {
     var codecs: [String]
     var averageBandwidth: Int
@@ -112,8 +112,36 @@ struct HLSVariant {
     var frameRate: Double?
     var videoRange: VideoRange
 
-    /// - Parameter mediaURI: The media playlist, relative to the master playlist
-    func masterPlaylist(mediaURI: String) -> String {
+    /// - Parameters:
+    ///   - mediaURI: The media playlist, relative to the master playlist
+    ///   - subtitles: Text subtitle renditions and their playlist URIs
+    ///   - startTime: Where playback should begin (EXT-X-START; per request, so a reload can resume anywhere)
+    func masterPlaylist(mediaURI: String, subtitles: [(track: SubtitleTrack, uri: String)] = [],
+                        startTime: Double = 0) -> String {
+        var lines = ["#EXTM3U", "#EXT-X-VERSION:7", "#EXT-X-INDEPENDENT-SEGMENTS"]
+        if startTime > 0 {
+            lines.append(String(format: "#EXT-X-START:TIME-OFFSET=%.3f,PRECISE=YES", startTime))
+        }
+
+        // One subtitle group. No DEFAULT=YES: Matroska's default flag is on unless cleared, so it says
+        // little; the receiver's own subtitle settings (AUTOSELECT) and FORCED decide. NAME must be unique.
+        var usedNames = Set<String>()
+        for (track, uri) in subtitles {
+            var name = track.displayName
+            var suffix = 2
+            while usedNames.contains(name) { name = "\(track.displayName) \(suffix)"; suffix += 1 }
+            usedNames.insert(name)
+            var attributes = [
+                "TYPE=SUBTITLES", "GROUP-ID=\"subs\"", "NAME=\"\(name.replacingOccurrences(of: "\"", with: "'"))\"",
+                "DEFAULT=NO", "AUTOSELECT=YES", "FORCED=\(track.isForced ? "YES" : "NO")",
+            ]
+            if let language = track.languageTag {
+                attributes.append("LANGUAGE=\"\(language)\"")
+            }
+            attributes.append("URI=\"\(uri)\"")
+            lines.append("#EXT-X-MEDIA:" + attributes.joined(separator: ","))
+        }
+
         var attributes = [
             "BANDWIDTH=\(peakBandwidth)",
             "AVERAGE-BANDWIDTH=\(averageBandwidth)",
@@ -125,7 +153,10 @@ struct HLSVariant {
         // AVFoundation rejects an HEVC PQ variant without FRAME-RATE ("unsupported URL"). Verified on macOS 26.
         attributes.append(String(format: "FRAME-RATE=%.3f", frameRate ?? 24))
         attributes.append("VIDEO-RANGE=\(videoRange.rawValue)")
-        return ["#EXTM3U", "#EXT-X-VERSION:7", "#EXT-X-INDEPENDENT-SEGMENTS",
-                "#EXT-X-STREAM-INF:" + attributes.joined(separator: ","), mediaURI].joined(separator: "\n") + "\n"
+        if !subtitles.isEmpty {
+            attributes.append("SUBTITLES=\"subs\"")
+        }
+        lines += ["#EXT-X-STREAM-INF:" + attributes.joined(separator: ","), mediaURI]
+        return lines.joined(separator: "\n") + "\n"
     }
 }

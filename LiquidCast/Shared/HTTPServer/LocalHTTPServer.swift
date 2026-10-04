@@ -9,15 +9,26 @@ struct HTTPRequest: Sendable {
     let method: String
     /// Decoded path without the leading "/" and without a query string
     let path: String
+    /// Decoded query parameters
+    var query: [String: String] = [:]
 }
 
 struct HTTPResponse: Sendable {
     let status: Int
     let contentType: String
     let body: Data
+    /// Called with how long the client took to receive the whole response (seconds): from the start of
+    /// sending until the client closes its end, which it does once it has every byte (we send
+    /// `Connection: close`). Not "until the bytes were handed to the kernel": the socket send buffer
+    /// (several MB, auto-tuned) would absorb a whole segment. If the client is still receiving at
+    /// `deliveryDeadline`, that elapsed time is reported (it's at least that slow).
+    var onDelivered: (@Sendable (TimeInterval) -> Void)? = nil
+    var deliveryDeadline: TimeInterval = 60
 
-    static func ok(_ body: Data, contentType: String) -> HTTPResponse {
-        HTTPResponse(status: 200, contentType: contentType, body: body)
+    static func ok(_ body: Data, contentType: String, deliveryDeadline: TimeInterval = 60,
+                   onDelivered: (@Sendable (TimeInterval) -> Void)? = nil) -> HTTPResponse {
+        HTTPResponse(status: 200, contentType: contentType, body: body, onDelivered: onDelivered,
+                     deliveryDeadline: deliveryDeadline)
     }
 
     static func error(_ status: Int) -> HTTPResponse {
@@ -207,6 +218,7 @@ final class LocalHTTPServer: @unchecked Sendable {
             send(.error(405), method: request.method, on: connection)
             return
         }
+        logger.debug("\(request.method, privacy: .public) /\(request.path, privacy: .public)")
         exchange.handlerTask = Task {
             let response = await handler(request)
             guard !Task.isCancelled else { return }
@@ -226,9 +238,39 @@ final class LocalHTTPServer: @unchecked Sendable {
         if method != "HEAD" {
             payload.append(response.body)
         }
-        connection.send(content: payload, isComplete: true, completion: .contentProcessed { _ in
-            connection.cancel()
+        let started = Date()
+        connection.send(content: payload, isComplete: true, completion: .contentProcessed { [weak self] error in
+            guard let self, error == nil, method != "HEAD", let onDelivered = response.onDelivered else {
+                connection.cancel()
+                return
+            }
+            // Delivered when the client closes (it has read everything); still open at the deadline
+            // means it's at least that slow
+            self.awaitClientClose(connection, deadline: started.addingTimeInterval(response.deliveryDeadline)) { _ in
+                onDelivered(Date().timeIntervalSince(started))
+                connection.cancel()
+            }
         })
+    }
+
+    /// Read (and discard) until the client closes the connection, or the deadline passes
+    private func awaitClientClose(_ connection: NWConnection, deadline: Date, completion: @escaping @Sendable (Bool) -> Void) {
+        let once = OSAllocatedUnfairLock(initialState: false)
+        let finish: @Sendable (Bool) -> Void = { closed in
+            let first = once.withLock { done -> Bool in defer { done = true }; return !done }
+            if first { completion(closed) }
+        }
+        queue.asyncAfter(deadline: .now() + max(deadline.timeIntervalSinceNow, 0)) { finish(false) }
+        func next() {
+            connection.receive(minimumIncompleteLength: 1, maximumLength: 4096) { _, _, isComplete, error in
+                if isComplete || error != nil {
+                    finish(error == nil || isComplete)
+                } else {
+                    next()
+                }
+            }
+        }
+        next()
     }
 
     static func parse(_ header: Data) -> HTTPRequest? {
@@ -238,12 +280,17 @@ final class LocalHTTPServer: @unchecked Sendable {
         guard parts.count >= 2 else { return nil }
 
         var path = String(parts[1])
-        if let query = path.firstIndex(of: "?") {
-            path = String(path[..<query])
+        var query: [String: String] = [:]
+        if let mark = path.firstIndex(of: "?") {
+            for pair in path[path.index(after: mark)...].split(separator: "&") {
+                let keyValue = pair.split(separator: "=", maxSplits: 1).map { String($0).removingPercentEncoding ?? String($0) }
+                if let key = keyValue.first { query[key] = keyValue.count > 1 ? keyValue[1] : "" }
+            }
+            path = String(path[..<mark])
         }
         path = path.removingPercentEncoding ?? path
         while path.hasPrefix("/") { path.removeFirst() }
-        return HTTPRequest(method: String(parts[0]), path: path)
+        return HTTPRequest(method: String(parts[0]), path: path, query: query)
     }
 }
 

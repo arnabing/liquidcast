@@ -2,6 +2,9 @@ import SwiftUI
 import AVFoundation
 import Combine
 import os.log
+#if os(macOS)
+import Network
+#endif
 
 private let appStateLogger = Logger(subsystem: "com.liquidcast", category: "AppState")
 
@@ -131,6 +134,26 @@ class AppState: ObservableObject {
 
     @Published var isSeeking: Bool = false              // True during seek operation
     @Published var isBuffering: Bool = false            // Player is waiting for data
+
+    // MARK: - Subtitles
+
+    enum SubtitleChoice: Hashable {
+        case off
+        /// Text subtitle option of the player item (renditions or the file's own tracks)
+        case text(Int)
+        /// Bitmap subtitle stream, burned into the video
+        case burnIn(Int)
+    }
+
+    struct SubtitleMenuItem: Hashable {
+        let choice: SubtitleChoice
+        let name: String
+    }
+
+    /// What the subtitle menu offers for the current file
+    @Published var subtitleMenu: [SubtitleMenuItem] = []
+    @Published var subtitleChoice: SubtitleChoice = .off
+    private var textSubtitleNames: [String] = []
     @Published var seekPreviewPosition: Double? = nil   // Preview position during drag (nil = not dragging)
 
     private var seekDebounceTask: Task<Void, Never>? = nil
@@ -139,6 +162,12 @@ class AppState: ObservableObject {
     private var loadStartPosition: Double = 0
     /// Passthrough kinds already given up on for the current file (grows with each failed attempt)
     private var loadExcludedPassthrough: Passthrough = []
+    /// Burn-in choice of the current file (kept when the stream is reloaded)
+    private var loadBurnIn: SubtitleBurnIn = .automatic
+    private var stallCheck: Task<Void, Never>?
+    #if os(macOS)
+    private let networkMonitor = NWPathMonitor()
+    #endif
 
     /// Formatted streaming info for display
     var streamingInfoText: String {
@@ -284,8 +313,37 @@ class AppState: ObservableObject {
         mediaPlayer.onBufferingChanged = { [weak self] isBuffering in
             Task { @MainActor in
                 self?.isBuffering = isBuffering
+                self?.updateStallCheck()
             }
         }
+
+        mediaPlayer.onSubtitleOptionsChanged = { [weak self] names in
+            Task { @MainActor in
+                self?.textSubtitleNames = names
+                self?.rebuildSubtitleMenu()
+            }
+        }
+
+        mediaPlayer.onSubtitleSelectionChanged = { [weak self] index in
+            Task { @MainActor in
+                guard let self, self.transcodeManager.burnedInSubtitle == nil else { return }
+                self.subtitleChoice = index.map { .text($0) } ?? .off
+            }
+        }
+
+        transcodeManager.$subtitleTracks
+            .combineLatest(transcodeManager.$burnedInSubtitle)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _, _ in self?.rebuildSubtitleMenu() }
+            .store(in: &cancellables)
+
+        #if os(macOS)
+        // The stream URL contains this Mac's address; follow it when the network changes
+        networkMonitor.pathUpdateHandler = { [weak self] _ in
+            Task { @MainActor in self?.followNetworkChange() }
+        }
+        networkMonitor.start(queue: DispatchQueue(label: "com.liquidcast.network"))
+        #endif
 
         // Streams are published as complete VOD playlists, so player time is movie time
         // and the duration is the full movie from the start
@@ -368,7 +426,10 @@ class AppState: ObservableObject {
     ///   - resumeAt: Start here instead of the saved position
     ///   - excludingPassthrough: Don't pass these through for this file, even if the receiver is
     ///     believed to support them (set after a passed-through attempt failed)
-    func loadMedia(from url: URL, resumeAt: Double? = nil, excludingPassthrough: Passthrough = []) {
+    ///   - burnIn: Bitmap subtitles to draw into the video
+    func loadMedia(from url: URL, resumeAt: Double? = nil, excludingPassthrough: Passthrough = [],
+                   burnIn: SubtitleBurnIn = .automatic,
+                   subtitles: MediaPlayerController.SubtitleSelection = .automatic) {
         appStateLogger.info("🎬 Loading media: \(url.lastPathComponent)")
 
         // Cancel any previous load operation (also kills its FFmpeg and deletes its segments), and
@@ -393,6 +454,8 @@ class AppState: ObservableObject {
         let savedPosition = resumeAt ?? CacheManager.getPlaybackPosition(for: url) ?? 0
         loadStartPosition = savedPosition
         loadExcludedPassthrough = excludingPassthrough
+        loadBurnIn = burnIn
+        subtitleChoice = .off
         let passthrough = receiverPassthrough.subtracting(excludingPassthrough)
 
         if savedPosition > 0 {
@@ -407,7 +470,8 @@ class AppState: ObservableObject {
                     from: url,
                     mode: compatibilityMode,
                     startPosition: savedPosition,
-                    passthrough: passthrough
+                    passthrough: passthrough,
+                    burnIn: burnIn
                 )
 
                 // Check if this load was superseded by a newer one
@@ -417,7 +481,8 @@ class AppState: ObservableObject {
                 }
 
                 appStateLogger.info("✅ Ready to play: \(playableURL.absoluteString)")
-                mediaPlayer.loadMedia(from: playableURL, startTime: playableURL.isFileURL ? savedPosition : 0)
+                mediaPlayer.loadMedia(from: playableURL, startTime: playableURL.isFileURL ? savedPosition : 0,
+                                      subtitles: subtitles)
             } catch {
                 // Ignore errors from superseded loads
                 if Task.isCancelled || thisGeneration != loadGeneration {
@@ -426,6 +491,105 @@ class AppState: ObservableObject {
                 }
                 appStateLogger.error("❌ Failed to prepare media: \(error.localizedDescription)")
                 conversionError = error.localizedDescription
+            }
+        }
+    }
+
+    // MARK: - Subtitle selection
+
+    private func rebuildSubtitleMenu() {
+        var items = [SubtitleMenuItem(choice: .off, name: "Off")]
+        items += textSubtitleNames.enumerated().map { SubtitleMenuItem(choice: .text($0.offset), name: $0.element) }
+        // Bitmap tracks can't be rendered by the player; they're drawn into the (re-encoded) video
+        items += transcodeManager.subtitleTracks.filter { $0.kind == .image }.map {
+            SubtitleMenuItem(choice: .burnIn($0.streamIndex), name: "\($0.displayName) (burned in)")
+        }
+        subtitleMenu = items
+        if let burned = transcodeManager.burnedInSubtitle {
+            subtitleChoice = .burnIn(burned)
+        } else if let selected = mediaPlayer.selectedSubtitleIndex {
+            subtitleChoice = .text(selected)
+        } else if case .burnIn = subtitleChoice {
+            subtitleChoice = .off
+        }
+    }
+
+    /// The text subtitle state to carry into a reload of the same file
+    private var currentSubtitleSelection: MediaPlayerController.SubtitleSelection {
+        switch subtitleChoice {
+        case .text(let index): return .option(index)
+        case .off, .burnIn: return .off
+        }
+    }
+
+    func selectSubtitle(_ choice: SubtitleChoice) {
+        let wasBurnedIn = transcodeManager.burnedInSubtitle
+        subtitleChoice = choice
+        switch choice {
+        case .off:
+            mediaPlayer.selectSubtitle(at: nil)
+            if wasBurnedIn != nil { reloadCurrent(burnIn: .off, subtitles: .off) }
+        case .text(let index):
+            mediaPlayer.selectSubtitle(at: index)
+            if wasBurnedIn != nil { reloadCurrent(burnIn: .off, subtitles: .option(index)) }
+        case .burnIn(let stream):
+            mediaPlayer.selectSubtitle(at: nil)
+            if wasBurnedIn != stream { reloadCurrent(burnIn: .stream(stream), subtitles: .off) }
+        }
+    }
+
+    /// Prepare the current file again (different burn-in) and continue from the current position
+    private func reloadCurrent(burnIn: SubtitleBurnIn, subtitles: MediaPlayerController.SubtitleSelection) {
+        guard let url = selectedMediaURL else { return }
+        let position = playbackProgress > 0 ? playbackProgress : loadStartPosition
+        loadMedia(from: url, resumeAt: position, excludingPassthrough: loadExcludedPassthrough,
+                  burnIn: burnIn, subtitles: subtitles)
+    }
+
+    // MARK: - Network changes
+
+    #if os(macOS)
+    /// The stream URL carries this Mac's address at the time playback started. When the address changes
+    /// (Wi-Fi ↔ Ethernet, VPN, new DHCP lease), point the player at the same session's new address and
+    /// continue from the current position. Nothing to do for direct file playback.
+    private func followNetworkChange() {
+        let position = playbackProgress
+        guard let current = mediaPlayer.currentURL, current.scheme == "http",
+              let updated = transcodeManager.currentPlaylistURL(startTime: position),
+              updated.host != current.host else { return }
+        appStateLogger.info("🌐 Network address changed (\(current.host ?? "?") → \(updated.host ?? "?")) - reconnecting at \(Int(position))s")
+        // The playlist URL carries the position (EXT-X-START), so the player asks for the right segment first
+        mediaPlayer.loadMedia(from: updated, subtitles: currentSubtitleSelection)
+    }
+    #endif
+
+    // MARK: - Stalls
+
+    /// A stalled passthrough stream triggers the fallback only when the data demonstrably arrived: the
+    /// receiver has fully downloaded ≥2 segments past the playhead, yet nothing played for `stallLimit`
+    /// (not while seeking). Slow transcoding or a slow network never looks like that. Direct-played files
+    /// are left to the player's own error reporting: there's no view of what the receiver has.
+    private static let stallLimit: TimeInterval = 10
+
+    private func updateStallCheck() {
+        stallCheck?.cancel()
+        guard isBuffering, !transcodeManager.passthroughUsed.isEmpty, mediaPlayer.currentURL?.scheme == "http" else { return }
+        stallCheck = Task { @MainActor [weak self] in
+            var stalledSince = Date()
+            var position = self?.playbackProgress ?? 0
+            while let self, !Task.isCancelled, self.isBuffering {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                if self.isSeeking || abs(self.playbackProgress - position) > 0.5 {
+                    stalledSince = Date()  // Moving (or the user moved it): not a stall
+                    position = self.playbackProgress
+                    continue
+                }
+                guard Date().timeIntervalSince(stalledSince) >= Self.stallLimit else { continue }
+                let delivered = await self.transcodeManager.segmentsDeliveredAhead(of: position) ?? 0
+                guard !Task.isCancelled, self.isBuffering, delivered >= 2 else { continue }
+                appStateLogger.warning("⚠️ \(delivered) segments delivered but playback stalled for \(Int(Self.stallLimit))s")
+                self.handlePlaybackFailure(nil)
+                return
             }
         }
     }
@@ -474,7 +638,8 @@ class AppState: ObservableObject {
             appStateLogger.warning("⚠️ '\(device)' can't play \(culprit.name) - converting it for this device from now on")
         }
         appStateLogger.warning("⚠️ Playback with \(culprit.name) failed (\(error?.localizedDescription ?? "unknown error")) - retrying without it at \(Int(position))s")
-        loadMedia(from: url, resumeAt: position, excludingPassthrough: loadExcludedPassthrough.union(culprit))
+        loadMedia(from: url, resumeAt: position, excludingPassthrough: loadExcludedPassthrough.union(culprit),
+                  burnIn: loadBurnIn, subtitles: currentSubtitleSelection)
     }
 
     /// Errors meaning "can't decode/understand this media", as opposed to network or server trouble

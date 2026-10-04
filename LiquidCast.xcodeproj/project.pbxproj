@@ -48,6 +48,7 @@
 		A1400020001 /* StreamProfile.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1400020000 /* StreamProfile.swift */; };
 		A1400030001 /* KeyframeIndex.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1400030000 /* KeyframeIndex.swift */; };
 		A1400040001 /* MP4Segment.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1400040000 /* MP4Segment.swift */; };
+		A1400050001 /* Subtitles.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1400050000 /* Subtitles.swift */; };
 		A1400003001 /* MediaAnalyzer.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1400003000 /* MediaAnalyzer.swift */; };
 		A1400004001 /* MediaAnalyzer.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1400003000 /* MediaAnalyzer.swift */; };
 		A1500001001 /* MiniPlayerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1500001000 /* MiniPlayerView.swift */; };
@@ -84,6 +85,7 @@
 		A1400020000 /* StreamProfile.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamProfile.swift; sourceTree = "<group>"; };
 		A1400030000 /* KeyframeIndex.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeyframeIndex.swift; sourceTree = "<group>"; };
 		A1400040000 /* MP4Segment.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MP4Segment.swift; sourceTree = "<group>"; };
+		A1400050000 /* Subtitles.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Subtitles.swift; sourceTree = "<group>"; };
 		A1400003000 /* MediaAnalyzer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaAnalyzer.swift; sourceTree = "<group>"; };
 		A1500001000 /* MiniPlayerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MiniPlayerView.swift; sourceTree = "<group>"; };
 		A2000001000 /* LiquidCast.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = LiquidCast.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -288,6 +290,7 @@
 				A1400020000 /* StreamProfile.swift */,
 				A1400030000 /* KeyframeIndex.swift */,
 				A1400040000 /* MP4Segment.swift */,
+				A1400050000 /* Subtitles.swift */,
 			);
 			path = Transcoder;
 			sourceTree = "<group>";
@@ -451,6 +454,7 @@
 				A1400020001 /* StreamProfile.swift in Sources */,
 				A1400030001 /* KeyframeIndex.swift in Sources */,
 				A1400040001 /* MP4Segment.swift in Sources */,
+				A1400050001 /* Subtitles.swift in Sources */,
 				A1400003001 /* MediaAnalyzer.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

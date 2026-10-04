@@ -92,6 +92,24 @@ struct MenuBarContentView: View {
         .keyboardShortcut(.rightArrow, modifiers: [])
         .disabled(appState.selectedMediaURL == nil)
 
+        // Subtitles: text tracks the player renders, bitmap tracks burned into the video
+        if appState.subtitleMenu.count > 1 {
+            Menu("Subtitles") {
+                ForEach(appState.subtitleMenu, id: \.self) { item in
+                    Button {
+                        appState.selectSubtitle(item.choice)
+                    } label: {
+                        HStack {
+                            Text(item.name)
+                            if appState.subtitleChoice == item.choice {
+                                Image(systemName: "checkmark")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         Divider()
 
         // File operations

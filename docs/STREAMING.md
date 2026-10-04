@@ -27,7 +27,9 @@ file ─► MediaAnalyzer (ffprobe)
 | anything else — or copy would give segments over 10s | H.264 (`h264_videotoolbox`, MPEG-TS); HDR tone-mapped to SDR | see below |
 
 Audio: AC-3 and E-AC-3 (including Dolby Atmos) are copied untouched for an Apple TV receiver.
-Everything else becomes AAC in mono, stereo or 5.1 (Ultra keeps 5.1, never upmixes), resampled to
+Everything else becomes AAC in mono, stereo or 5.1 (never upmixed; 5.1 is kept for an Apple TV, which
+downmixes for its own output, and with Ultra; smart TVs otherwise get stereo; 192/384 kbps for
+stereo/5.1, 320/512 with Ultra), resampled to
 48kHz if higher.
 
 | File | Responsibility |
@@ -42,7 +44,14 @@ Everything else becomes AAC in mono, stereo or 5.1 (Ultra keeps 5.1, never upmix
 
 ## Why a complete VOD playlist
 
-The playlist lists every segment and ends with `#EXT-X-ENDLIST` before encoding starts. So:
+Every stream has a multivariant playlist (`playlist.m3u8`): the one variant with its exact `CODECS`
+(copied video: read from the stream's `avcC`/`hvcC`; re-encoded H.264: profile and the level set on
+the encoder, the smallest that fits the frame size, macroblock rate, peak bitrate and decoder buffer
+per H.264 Table A-1), `VIDEO-RANGE`, `RESOLUTION`, `FRAME-RATE`, bandwidth, and the text subtitle
+renditions. It's made per request: `?start=<seconds>` becomes `#EXT-X-START` (AVPlayer honours it in
+the multivariant playlist - verified), so the first load resumes and a reload continues where playback
+is. The media playlist (`media.m3u8`) lists every segment and ends with `#EXT-X-ENDLIST` before
+encoding starts. So:
 
 - the player knows the full duration immediately and seeks natively, with no seek-offset math in the app
 - playback starts where we say (`#EXT-X-START`, used for resume), not "3 segments from the live edge",
@@ -144,6 +153,60 @@ stated as BT.2020 (files often leave them untagged, and zscale then fails). It's
 realtime at 1080p; 4K sources are scaled to 1080p first (in the same zscale pass), which brings them
 from ~1.4× to ~3.5× realtime and cuts CPU by two thirds.
 
+## Subtitles
+
+- **Text** (SRT, ASS, WebVTT, mov_text, …) becomes a WebVTT rendition (`#EXT-X-MEDIA:TYPE=SUBTITLES`,
+  `subs/<stream>/index.m3u8`), selectable on the TV or from the app's Subtitles menu. `FORCED` follows
+  the file; `DEFAULT` is never set (Matroska's default flag is on unless cleared, so it says little;
+  the receiver's subtitle settings decide via `AUTOSELECT`).
+- **Extraction is windowed**: a segment needs only the 60s window(s) it overlaps, read by seeking into
+  the file (plus 30s before, for cues still showing), so no request waits for a whole-file demux. Windows
+  are shared between requests, prefetched (around the playhead when a track is opened, then the next
+  one), and cancelled with the session.
+- **Text is sanitised**: only `<b>`/`<i>`/`<u>` markup is kept, other tags (SRT `<font>`) are dropped,
+  stray `<`, `>`, `&` are escaped and `-->` is broken up (it would end the cue). **ASS/SSA** events are
+  converted from the original script rather than by FFmpeg (which keeps vector drawings as text and drops
+  positioning): drawings are removed, `\an`/style alignment becomes `line:`/`align:` cue settings.
+- **Timing.** Video timestamps are media time + 10s in both MPEG-TS (`mpegts_copyts=1`, so the TS
+  muxer adds no delay of its own) and fMP4. Cues are written on that same timeline with an identity
+  `X-TIMESTAMP-MAP` (`MPEGTS=900000,LOCAL=00:00:10.000`). AVPlayer on macOS 26 ignores the map and
+  reads cue times as stream timestamps (measured: changing `MPEGTS` moved nothing); a player that
+  applies the map gets the identical result. Verified: cues arrive within 20ms of their source time.
+- **Bitmaps** (PGS, VobSub, DVB) can't be rendered by the player; they're drawn into the video when
+  chosen in the menu (re-encode: `scale2ref` sizes the subtitle canvas to the video, `overlay`, after
+  tone mapping if any). A bitmap track the file marks forced is burned in automatically only when the
+  video is re-encoded anyway, so it never costs HEVC/HDR passthrough. Choosing one reloads the stream
+  at the current position.
+
+## Adaptive bitrate (re-encoded streams)
+
+Restarted jobs are interchangeable at any bitrate, so the bitrate can change at any segment boundary
+without a glitch. The server measures how long each segment took to *reach* the receiver: from the
+start of sending until the client closes the connection, which it does once it has every byte (the
+response says `Connection: close`; AVPlayer does). Measuring until the kernel accepted the bytes would
+be meaningless: macOS auto-tunes the socket send buffer to several MB, a whole segment. A client still
+receiving after 3× the segment's duration counts as that slow. Two
+deliveries in a row slower than 80% of the segment's own duration step down a rung (100% → 60% →
+35% of the target); five faster than 30%, at least 30s after the last change, step back up.
+Segments already made at the old rate but not yet requested are dropped, and the job restarts at the
+first segment the player doesn't have (a requested segment still being made is made by the new job,
+so its request isn't cut off), so a change takes effect immediately. Deliveries of segments made at
+the old rate don't count toward the next decision. Stream-copied video has a fixed bitrate.
+
+## Network changes and stalls
+
+- The stream URL carries the Mac's LAN address. `AppState` watches the network (`NWPathMonitor`);
+  if the address changes (Wi-Fi ↔ Ethernet, VPN, new lease) it points the player at the same session
+  on the new address, with `?start=` at the current position (subtitle choice kept). The server
+  listens on all interfaces, and sessions don't depend on the address.
+- A passthrough stream that stalls *although the data arrived* (the receiver has fully downloaded ≥2
+  segments past the playhead) without moving for 10s (not while seeking; checked continuously while
+  buffering) is treated like a playback failure: retried without the most likely culprit, but not
+  recorded against the device. Slow transcoding or a slow network never looks like that. Direct-played
+  files are left to the player's error reporting (the Mac can't see what the receiver has).
+- Subtitle choices survive every reload (burn-in switch, network change, passthrough fallback); "Off"
+  is applied explicitly, and the menu follows the player's actual selection.
+
 ## Making restarted jobs interchangeable
 
 A segment written by a job that started at segment 40 must match the one a job started at 0
@@ -203,8 +266,9 @@ segments into another's would jump. The mechanisms:
 - **Re-encoding is always H.264.** Non-HEVC HDR sources (e.g. VP9/AV1 HDR) are tone-mapped to SDR
   rather than re-encoded as HEVC HDR.
 - **Passthrough detection is optimistic.** Non-brand device names are taken as Apple TVs with
-  HEVC/HDR support; an older receiver fails once, then falls back (see above). A failure that only
-  shows as a stall, without the player reporting an error, doesn't trigger the fallback.
+  HEVC/HDR support; an older receiver fails once (or stalls with data in hand), then falls back.
+- **Dolby Vision is passed through as HDR10.** Full DV (profile 5, or 8.1 with the RPU kept) isn't
+  attempted: no DV sample was available to verify it, and FFmpeg can't create one.
 - **Dolby Vision profile 5** (no HDR10 base layer) is re-encoded without proper DV colour
   conversion, so colours are wrong. Needs libplacebo-style DV processing.
 - **Tone-mapped output is at most 1080p** (4K HDR is scaled down for SDR receivers to keep software
@@ -215,9 +279,14 @@ segments into another's would jump. The mechanisms:
   a segment starting there drops a few leading frames after a seek. Not detected yet.
 - DTS and TrueHD are converted to AAC (up to 5.1), not to a Dolby format, so DTS:X/TrueHD Atmos
   lose their object audio.
-- Only the first audio track is used; subtitles are dropped.
-- The stream URL contains the Mac's IP address at the time playback started. A network change
-  mid-playback (VPN, Wi-Fi ↔ Ethernet) breaks the stream.
+- One audio track is streamed (the default, or a same-language Dolby one for passthrough); there's
+  no in-app audio track switching.
+- Closed captions (CEA-608/708) and teletext aren't extracted.
+- Burned-in bitmap subtitles need a re-encode, so they replace HEVC/HDR passthrough for that stream.
+- After a restart (seek, bitrate change), a burned-in bitmap subtitle that started more than one
+  Matroska cluster earlier isn't shown until the next subtitle event (a few seconds at most). Fixing it
+  means seeking every job earlier and trimming, which touches the restart timing everything else
+  depends on; a second subtitle input doesn't work (FFmpeg blanks the overlay when that input ends).
 
 ## Verifying changes
 
@@ -238,6 +307,18 @@ the real sources and checks, for re-encode and stream-copy sources in MKV and MP
   frame at its source time and audio alongside — the check that catches lip-sync offsets
 - audio track choice: a DTS-first MKV passes its E-AC-3 track through, and converts the DTS one without
   passthrough
+- subtitles: WebVTT parsing and sanitising; ASS conversion (drawings dropped, italics/line breaks,
+  alignment → cue settings); windowed extraction keeps media-time cue times; a text track appears as a
+  rendition AVPlayer offers, and its cue is shown at the source time (13.48s vs 13.50s); a PGS track
+  burned in through the live pipeline changes the subtitle area and nothing else, compared with the
+  same stream without burn-in; a forced PGS track keeps HEVC passthrough and is burned in only when
+  re-encoding
+- H.264 level: smallest level for 1080p24/1080p60/4K24 and Main-profile bitrates
+- adaptive bitrate: AVPlayer's own segment downloads are measured (it closes after each response); a
+  client reading at 300 kB/s makes the session step down to 60%, and later segments are ~40% smaller
+- network switch: the same session reached at another address via a `?start=` URL continues at the
+  position (no seek)
+- surround: 5.1 kept for Apple TV without Ultra, stereo for smart TVs
 - Dolby audio: copied AC-3 (MPEG-TS) and E-AC-3 (fMP4) restarts match a continuous job exactly;
   AVPlayer plays both with `ac-3`/`ec-3` tracks, before and after a far seek; an H.264 + E-AC-3 MP4
   is played directly with passthrough and converted to HLS without

@@ -8,7 +8,7 @@ extension TranscodeManager {
 
     /// iOS does not support FFmpeg transcoding
     func performPreparation(from url: URL, mode: CompatibilityMode, startPosition: Double,
-                            allowHEVC: Bool) async throws -> URL {
+                            passthrough: Passthrough) async throws -> URL {
         logger.error("📱 Conversion not supported on iOS")
         throw TranscodeError.notSupportedOnPlatform
     }

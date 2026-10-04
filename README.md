@@ -99,6 +99,7 @@ LiquidCast/
 - **On-demand HLS** — Playback starts in about a second; the whole movie is seekable immediately, and segments are encoded as the TV asks for them
 - **Stream copy when possible** — H.264 video is passed through untouched; only the audio is converted
 - **HDR passthrough** — HEVC, HDR10, HLG and Dolby Vision (profiles 7 and 8, as HDR10) play untouched on Apple TV 4K; other receivers get tone-mapped SDR
+- **Dolby audio passthrough** — AC-3 and E-AC-3, including Dolby Atmos, reach the Apple TV untouched; native MP4/MOV files play without any conversion
 - **Hardware encoding** — Uses your Mac's VideoToolbox for speed
 - **Local server** — Streams to Apple TV over your network
 - **Minimal dependencies** — Just FFmpeg + Apple frameworks

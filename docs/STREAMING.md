@@ -8,7 +8,8 @@ each piece is the way it is. Every FFmpeg behaviour described here was verified 
 ```
 file ─► MediaAnalyzer (ffprobe)
           │
-          ├─ H.264 + AAC in MP4/MOV ─────────────► AVPlayer(file URL)          direct play
+          ├─ H.264 + AAC in MP4/MOV, or (Apple TV) ─► AVPlayer(file URL)       direct play
+          │  HEVC hvc1 / AC-3 / E-AC-3 in MP4/MOV
           │
           └─ anything else ─► StreamProfile + SegmentPlan
                                  │
@@ -21,11 +22,13 @@ file ─► MediaAnalyzer (ffprobe)
 
 | Source | Video | Audio |
 |---|---|---|
-| 8-bit 4:2:0 H.264 (Baseline/Main/High) in MKV/AVI/TS, or with DTS/AC3/... | stream copy (MPEG-TS) | AAC |
-| HEVC Main/Main 10 (SDR, HDR10, HLG, Dolby Vision 8), receiver plays HEVC | stream copy (fMP4), HDR kept | AAC |
-| anything else — or copy would give segments over 10s | H.264 (`h264_videotoolbox`, MPEG-TS); HDR tone-mapped to SDR | AAC |
+| 8-bit 4:2:0 H.264 (Baseline/Main/High) in MKV/AVI/TS, or with DTS/AC3/... | stream copy (MPEG-TS) | see below |
+| HEVC Main/Main 10 (SDR, HDR10, HLG, Dolby Vision 7/8), Apple TV receiver | stream copy (fMP4), HDR kept | see below |
+| anything else — or copy would give segments over 10s | H.264 (`h264_videotoolbox`, MPEG-TS); HDR tone-mapped to SDR | see below |
 
-Audio is AAC in mono, stereo or 5.1 (Ultra keeps 5.1, never upmixes), resampled to 48kHz if higher.
+Audio: AC-3 and E-AC-3 (including Dolby Atmos) are copied untouched for an Apple TV receiver.
+Everything else becomes AAC in mono, stereo or 5.1 (Ultra keeps 5.1, never upmixes), resampled to
+48kHz if higher.
 
 | File | Responsibility |
 |---|---|
@@ -76,17 +79,43 @@ Failures:
   restarting there forever
 - a HEAD request never starts FFmpeg; a client that disconnects releases its waiting request
 
-## HEVC and HDR passthrough
+## Passthrough for Apple TV (HEVC/HDR, Dolby audio, native files)
+
+For an Apple TV receiver ("passthrough allowed"), whatever it decodes natively isn't converted:
+
+- **Native files** — an MP4/MOV with H.264 or HEVC (`hvc1`, no Dolby Vision) and AAC/AC-3/E-AC-3 is
+  played directly from the file; FFmpeg doesn't run at all.
+- **Dolby audio** — AC-3/E-AC-3 is stream-copied into the segments (MPEG-TS or fMP4), so 5.1 and
+  Atmos reach the TV intact. Copied audio also lines up exactly across restarts: same source frames,
+  no AAC priming. HEVC (fMP4) streams declare it in the multivariant playlist (`ac-3`/`ec-3`); H.264
+  (MPEG-TS) streams are served as a media playlist and the receiver identifies the codec from the
+  stream.
+- **Audio track choice** — the default audio track is streamed. With Dolby passthrough, a
+  same-language AC-3/E-AC-3 track wins over a default TrueHD/DTS one (a common MKV layout), since
+  it can be passed through instead of converted.
+- **HEVC/HDR video** — below.
+
+### HEVC and HDR
 
 Apple's HLS spec requires fragmented MP4 for HEVC, so HEVC passthrough streams differ from the
 MPEG-TS ones in three ways (everything else, including restarts, is shared):
 
 - **Segments.** FFmpeg's segment muxer writes each segment as a self-contained fragmented MP4
-  (`ftyp` `moov` `moof`/`mdat`…) with `movflags=+frag_keyframe+empty_moov+default_base_moof+frag_discont`
-  and `use_editlist=1`. Without that combination each file's decode times (`tfdt`) restart at 0;
-  with it they're absolute, so segments from different jobs line up. The `moov` is byte-identical in
-  every file of every job, so the session serves the first file's `ftyp`+`moov` as `init.mp4`
-  (`#EXT-X-MAP`) and each segment as its `moof`/`mdat` boxes only (`<n>.m4s`).
+  (`ftyp` `moov` `moof`/`mdat`…) with `movflags=+frag_keyframe+delay_moov+default_base_moof+frag_discont`
+  and `use_editlist=1`. `delay_moov` (not `empty_moov`) because the muxer must see copied AC-3/E-AC-3
+  packets before it can write the `moov`. `frag_discont` + `use_editlist=1` make decode times (`tfdt`)
+  absolute instead of restarting at 0 in every file, but anchor each *file* at its first frame's
+  presentation time: with B-frames, decode times are shifted by that frame's composition offset
+  (it differs per file), and a per-file edit list (`edts`) undoes it. So `MP4Segment` normalises
+  what's served:
+  - **init** (`init.mp4`, `#EXT-X-MAP`): any file's `ftyp`+`moov` with `edts` removed. Byte-identical
+    for every file of every job
+  - **media segment** (`<n>.m4s`): the `moof`/`mdat` boxes, each track's `tfdt` reduced by that file's
+    first composition offset, which puts every file on the true decode timeline
+
+  Serving one file's raw init with everyone's segments instead puts video up to a few frames
+  (~0.1–0.2s) off audio, depending on which file the init came from; `use_editlist=0` and
+  `negative_cts_offsets` don't fix it (decode times reset to 0 / video consistently late).
 - **Multivariant playlist.** `playlist.m3u8` declares the variant (`HLSVariant`), so the receiver
   knows the codec and dynamic range before downloading: `CODECS` (exact HEVC string, read from the
   `hvcC` box of a one-frame probe), `VIDEO-RANGE` (PQ/HLG/SDR), `RESOLUTION`, bandwidth (file average,
@@ -96,13 +125,18 @@ MPEG-TS ones in three ways (everything else, including restarts, is shared):
   metadata and enhancement layer are stripped (`dovi_rpu=strip=1`) and it plays as HDR10. Profile 5
   has no such base layer and isn't passed through.
 
-Whether the receiver plays HEVC: `CompatibilityMode` is detected from the AirPlay device name.
-Brand names (Samsung, LG, Sony, Vizio, …) mean a smart TV and H.264; anything else, including tvOS's
-default room names ("Living Room"), is taken as an Apple TV, which plays HEVC/HDR. The user can
-override the mode in the menu. If an HEVC stream fails anyway, playback continues with H.264 from the
-same position. Only a decode/format error on the receiver (not a network drop or server error)
-records the device as HEVC-incapable, so it gets H.264 from then on; "Retry HEVC/HDR on All Devices"
-in the menu clears that list.
+Whether the receiver allows passthrough: `CompatibilityMode` is detected from the AirPlay device name.
+Brand names (Samsung, LG, Sony, Vizio, …) mean a smart TV, which gets converted streams; anything
+else, including tvOS's default room names ("Living Room"), is taken as an Apple TV. The user can
+override the mode in the menu.
+
+Passthrough is a set of capabilities (`Passthrough`: HEVC/HDR, Dolby audio, direct file playback).
+If passed-through playback fails, `AppState` retries without the most likely culprit, from the same
+position: HEVC first (e.g. an Apple TV HD), then direct file playback, then Dolby audio (which every
+Apple TV decodes). Another failure drops the next one. Only a decode/format error on the receiver
+(not a network drop or server error) records that capability as unsupported *for that device*, so an
+Apple TV HD that fails HEVC keeps Dolby passthrough. "Retry HDR & Dolby Passthrough on All Devices" in
+the menu clears the records.
 
 HDR sources that are re-encoded (non-HEVC, or a receiver without HEVC) are tone-mapped to SDR:
 `zscale` to linear light, `tonemap=hable`, `zscale` to BT.709, tagged BT.709. Input primaries are
@@ -168,7 +202,7 @@ segments into another's would jump. The mechanisms:
   keyframes (~0.7s per 1.7GB from SSD; slow from network shares). The result is cached.
 - **Re-encoding is always H.264.** Non-HEVC HDR sources (e.g. VP9/AV1 HDR) are tone-mapped to SDR
   rather than re-encoded as HEVC HDR.
-- **HEVC receiver detection is optimistic.** Non-brand device names are taken as Apple TVs with
+- **Passthrough detection is optimistic.** Non-brand device names are taken as Apple TVs with
   HEVC/HDR support; an older receiver fails once, then falls back (see above). A failure that only
   shows as a stall, without the player reporting an error, doesn't trigger the fallback.
 - **Dolby Vision profile 5** (no HDR10 base layer) is re-encoded without proper DV colour
@@ -179,7 +213,8 @@ segments into another's would jump. The mechanisms:
   not yet on an Apple TV over AirPlay.
 - **Open GOP.** Some files flag non-IDR keyframes (open-GOP H.264 I-frames, HEVC CRA pictures);
   a segment starting there drops a few leading frames after a seek. Not detected yet.
-- AC-3/E-AC-3 is re-encoded to AAC even though Apple TV plays it natively.
+- DTS and TrueHD are converted to AAC (up to 5.1), not to a Dolby format, so DTS:X/TrueHD Atmos
+  lose their object audio.
 - Only the first audio track is used; subtitles are dropped.
 - The stream URL contains the Mac's IP address at the time playback started. A network change
   mid-playback (VPN, Wi-Fi ↔ Ethernet) breaks the stream.
@@ -199,3 +234,10 @@ the real sources and checks, for re-encode and stream-copy sources in MKV and MP
   decode times; an HDR10 file streams through the multivariant playlist, AVFoundation sees a PQ
   variant, it plays from the resume point and after a far seek, the video track stays `hvc1`; without
   HEVC support the same file becomes tone-mapped BT.709 H.264 and plays
+- fMP4 timing: with a B-frame HEVC source, served segments (restarted or not) have their first video
+  frame at its source time and audio alongside — the check that catches lip-sync offsets
+- audio track choice: a DTS-first MKV passes its E-AC-3 track through, and converts the DTS one without
+  passthrough
+- Dolby audio: copied AC-3 (MPEG-TS) and E-AC-3 (fMP4) restarts match a continuous job exactly;
+  AVPlayer plays both with `ac-3`/`ec-3` tracks, before and after a far seek; an H.264 + E-AC-3 MP4
+  is played directly with passthrough and converted to HLS without

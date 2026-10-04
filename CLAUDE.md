@@ -32,13 +32,14 @@ LiquidCast is a macOS app for casting any video format to Apple TV via AirPlay. 
 - Saves playback position every 5s and resumes from it (cleared past 95%); seeks go straight to AVPlayer
 
 **TranscodeManager** (`Shared/Transcoder/TranscodeManager.swift` + `macOS/Transcoder/TranscodeManagerMacOS.swift`)
-- `prepareForAirPlay` returns the file URL (direct play: H.264+AAC in MP4/MOV) or an http:// HLS playlist
+- `prepareForAirPlay` returns the file URL (direct play: H.264+AAC in MP4/MOV; for Apple TV also HEVC hvc1 and Dolby audio) or an http:// HLS playlist
 - Owns the active `HLSSession` and the `LocalHTTPServer` (started once, kept for the app's lifetime)
 
 **On-demand HLS** (`macOS/Transcoder/`) - read `docs/STREAMING.md` before changing anything here
 - `SegmentPlan`: all segment boundaries decided up front → complete VOD playlist (full duration, native seeking, resume via `EXT-X-START`)
-- `StreamProfile`: copy (8-bit H.264 → MPEG-TS; HEVC/HDR → fMP4 when the receiver plays HEVC) or re-encode (VideoToolbox H.264, HDR tone-mapped); FFmpeg args for a job starting at any segment
-- `MP4Segment`: fMP4 init/media sections, HEVC codec string; `HLSVariant` (in `SegmentPlan.swift`) renders the multivariant playlist (CODECS, VIDEO-RANGE, FRAME-RATE)
+- `StreamProfile`: copy (8-bit H.264 → MPEG-TS; HEVC/HDR → fMP4 for Apple TV) or re-encode (VideoToolbox H.264, HDR tone-mapped); audio AAC, or AC-3/E-AC-3 copied for Apple TV; FFmpeg args for a job starting at any segment
+- `MP4Segment`: fMP4 init (edit lists removed) and media sections (decode times rebased per file), HEVC codec string; `HLSVariant` (in `SegmentPlan.swift`) renders the multivariant playlist (CODECS, VIDEO-RANGE, FRAME-RATE)
+- `Passthrough` (in `TranscodeManager.swift`): what an Apple TV gets untouched (HEVC/HDR, Dolby audio, native files); `AppState` drops one capability per failure and remembers decode failures per device
 - `HLSSession`: serve finished segment / wait for the running job / restart FFmpeg at the requested segment; pauses FFmpeg when far ahead
 - `KeyframeIndex`: keyframe scan for stream copy (cached), and where an FFmpeg seek actually lands
 - `FFmpegProcess`: actor around the subprocess; never blocks (no `waitUntilExit`), SIGKILL/SIGSTOP, `killAll()` on quit
@@ -72,7 +73,7 @@ LiquidCast is a macOS app for casting any video format to Apple TV via AirPlay. 
 - Video peaks are capped at 1.5x the target (`-maxrate`) so Wi-Fi delivery doesn't stall
 
 **Compatibility Mode** (`appState.compatibilityMode`)
-- `.appleTV`: H.264 High profile allowed; HEVC/HDR passed through untouched (falls back to H.264 per device if it fails)
+- `.appleTV`: H.264 High profile; passthrough of HEVC/HDR, AC-3/E-AC-3 (Atmos) and Apple-native files (falls back to converting, per device, if it fails)
 - `.smartTV`: H.264 Main profile for wider compatibility
 
 ## Project Structure

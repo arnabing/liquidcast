@@ -25,7 +25,7 @@ import Foundation
 /// Containers: MPEG-TS for H.264. Fragmented MP4 for HEVC passthrough (Apple's HLS spec requires
 /// fMP4 for HEVC): the segment muxer writes each segment as a self-contained fragmented MP4, with
 /// `frag_discont` + `use_editlist=1` so fragment decode times (`tfdt`) are absolute, not reset per
-/// file. See `MP4Segment` for how they're served.
+/// file, and `delay_moov` so copied Dolby audio can be described. See `MP4Segment` for how they're served.
 struct StreamProfile {
     enum Video: Equatable {
         /// Stream-copy (boundaries must be source keyframes): H.264, or HEVC for capable receivers
@@ -56,6 +56,9 @@ struct StreamProfile {
     var segmentFormat: SegmentFormat = .mpegts
     /// Remove Dolby Vision metadata, leaving the HDR10-compatible base layer (DV profiles 7 and 8)
     var stripDolbyVision = false
+    /// Audio passed through untouched ("ac3"/"eac3", incl. Atmos in E-AC-3) instead of AAC. Copied
+    /// audio also lines up exactly across restarts: same source frames, no encoder priming.
+    var copiedAudioCodec: String? = nil
     /// Tone mapping only: scale to this size first (4K → 1080p keeps software tone mapping ~3.5× realtime)
     var toneMapSize: (width: Int, height: Int)? = nil
 
@@ -166,9 +169,13 @@ struct StreamProfile {
         }
 
         if audioStreamIndex != nil {
-            args += ["-c:a", "aac", "-b:a", "\(audioBitrateKbps)k", "-ac", "\(audioChannels)"]
-            if let audioSampleRate {
-                args += ["-ar", "\(audioSampleRate)"]
+            if copiedAudioCodec != nil {
+                args += ["-c:a", "copy"]
+            } else {
+                args += ["-c:a", "aac", "-b:a", "\(audioBitrateKbps)k", "-ac", "\(audioChannels)"]
+                if let audioSampleRate {
+                    args += ["-ar", "\(audioSampleRate)"]
+                }
             }
         }
 
@@ -187,8 +194,10 @@ struct StreamProfile {
             ]
         }
         if segmentFormat == .fmp4 {
+            // delay_moov, not empty_moov: the moov must wait for the first packets, or the muxer can't
+            // describe copied AC-3/E-AC-3 ("Cannot write moov atom before AC3 packets")
             args += ["-segment_format_options",
-                     "movflags=+frag_keyframe+empty_moov+default_base_moof+frag_discont:use_editlist=1"]
+                     "movflags=+frag_keyframe+delay_moov+default_base_moof+frag_discont:use_editlist=1"]
         }
         args += [outputDirectory.appendingPathComponent("\(filePrefix)%05d.\(segmentFormat.fileExtension)").path]
         return args
@@ -197,19 +206,29 @@ struct StreamProfile {
     private static func format(_ value: Double) -> String {
         String(format: "%.6f", value)
     }
+
+    /// RFC 6381 codec of the streamed audio, for the multivariant playlist
+    var audioCodecString: String? {
+        guard audioStreamIndex != nil else { return nil }
+        switch copiedAudioCodec {
+        case "ac3": return "ac-3"
+        case "eac3": return "ec-3"
+        default: return "mp4a.40.2"
+        }
+    }
 }
 
 extension StreamProfile {
     /// Pick the profile for an analyzed source.
     /// - Parameters:
-    ///   - allowHEVC: The receiver plays HEVC (and HDR): pass suitable HEVC through untouched
+    ///   - passthrough: What the receiver accepts untouched: HEVC/HDR video, AC-3/E-AC-3 audio
     ///   - forceEncode: Re-encode even if the video could be stream-copied
     /// - Returns: nil if the source has no usable video stream.
     static func make(
         for analysis: MediaAnalysis,
         mode: CompatibilityMode,
         ultraQuality: Bool,
-        allowHEVC: Bool,
+        passthrough: Passthrough,
         forceEncode: Bool = false
     ) -> StreamProfile? {
         guard let video = analysis.primaryVideo else { return nil }
@@ -217,7 +236,7 @@ extension StreamProfile {
         let videoMode: Video
         var segmentFormat = SegmentFormat.mpegts
         var toneMapSize: (width: Int, height: Int)?
-        if !forceEncode && allowHEVC && analysis.isPassthroughHEVC {
+        if !forceEncode && passthrough.contains(.hevc) && analysis.isPassthroughHEVC {
             videoMode = .copy
             segmentFormat = .fmp4
         } else {
@@ -238,8 +257,11 @@ extension StreamProfile {
             }
         }
 
+        let audio = analysis.audioStream(preferDolby: passthrough.contains(.dolbyAudio))
+        let copyAudio = passthrough.contains(.dolbyAudio) && audio?.isDolbyAudio == true
+
         // Standard layouts only: mono, stereo, 5.1. Ultra keeps 5.1 (never upmixes); standard is stereo.
-        let sourceChannels = analysis.primaryAudio?.channels ?? 2
+        let sourceChannels = audio?.channels ?? 2
         let channels: Int
         switch sourceChannels {
         case ...1: channels = 1
@@ -247,17 +269,18 @@ extension StreamProfile {
         default: channels = 2
         }
         // Apple's HLS spec: AAC at 48kHz or below
-        let sampleRate = analysis.primaryAudio?.sampleRate.flatMap { $0 > 48_000 ? 48_000 : nil }
+        let sampleRate = audio?.sampleRate.flatMap { $0 > 48_000 ? 48_000 : nil }
 
         return StreamProfile(
             videoStreamIndex: video.index,
-            audioStreamIndex: analysis.primaryAudio?.index,
+            audioStreamIndex: audio?.index,
             video: videoMode,
             audioBitrateKbps: ultraQuality ? 320 : 192,
             audioChannels: channels,
             audioSampleRate: sampleRate,
             segmentFormat: segmentFormat,
             stripDolbyVision: segmentFormat == .fmp4 && video.dolbyVisionProfile != nil,
+            copiedAudioCodec: copyAudio ? audio?.codecName.lowercased() : nil,
             toneMapSize: toneMapSize
         )
     }

@@ -27,6 +27,14 @@ struct StreamInfo {
     var rotation: Int = 0
     /// Bits/s, if the container says (Matroska: the `BPS` tag)
     var bitRate: Int? = nil
+    /// Sample entry / FourCC in MP4/MOV ("avc1", "hvc1", "hev1", "ec-3", ...)
+    var codecTag: String? = nil
+    /// Marked as the default track of its type
+    var isDefault: Bool = false
+    /// ISO 639 language tag, if any
+    var language: String? = nil
+
+    var isDolbyAudio: Bool { codecName.lowercased() == "ac3" || codecName.lowercased() == "eac3" }
 
     /// Size as displayed (width/height swapped for ±90° rotation)
     var displaySize: (width: Int, height: Int)? {
@@ -78,8 +86,17 @@ struct MediaAnalysis {
     /// Primary video stream (first one)
     var primaryVideo: StreamInfo? { videoStreams.first }
 
-    /// Primary audio stream (first one)
-    var primaryAudio: StreamInfo? { audioStreams.first }
+    /// Primary audio stream: the one marked default, else the first
+    var primaryAudio: StreamInfo? { audioStreams.first { $0.isDefault } ?? audioStreams.first }
+
+    /// Audio to stream. With `preferDolby` (receiver plays AC-3/E-AC-3), a Dolby track in the primary
+    /// track's language beats a primary TrueHD/DTS one: common MKV layout is TrueHD Atmos first, then a
+    /// compatible E-AC-3/AC-3 track, and passing that through beats converting to AAC.
+    func audioStream(preferDolby: Bool) -> StreamInfo? {
+        guard let primary = primaryAudio else { return nil }
+        guard preferDolby, !primary.isDolbyAudio else { return primary }
+        return audioStreams.first { $0.isDolbyAudio && $0.language == primary.language } ?? primary
+    }
 
     /// Check if video is 10-bit (HDR)
     var is10BitVideo: Bool {
@@ -113,6 +130,25 @@ struct MediaAnalysis {
         let dolbyVisionOK = video.dolbyVisionProfile.map { [7, 8].contains($0) } ?? true
         return pixelFormatOK && profileOK && dolbyVisionOK
     }
+
+    /// AC-3 or E-AC-3 (incl. Dolby Atmos in E-AC-3): Apple TV decodes these natively
+    var isDolbyAudio: Bool { primaryAudio?.isDolbyAudio ?? false }
+
+    /// An MP4/MOV that Apple TV plays as-is when the receiver supports passthrough: H.264, or HEVC
+    /// tagged `hvc1` (Apple players reject `hev1`) without Dolby Vision, with AAC-family or Dolby
+    /// audio - in *every* audio track, since the player picks the track by language, not order
+    var isAppleNativeFile: Bool {
+        guard isNativeContainer, let video = primaryVideo else { return false }
+        let videoOK = isAppleDecodableH264
+            || (isPassthroughHEVC && video.codecTag == "hvc1" && video.dolbyVisionProfile == nil)
+        let aacFamily = ["aac", "mp3", "alac", "pcm_s16le", "pcm_s24le"]
+        let audioOK = audioStreams.allSatisfy { $0.isDolbyAudio || aacFamily.contains($0.codecName.lowercased()) }
+        return videoOK && audioOK
+    }
+
+    /// Whether playing this file directly relies on the receiver's HEVC / Dolby support
+    var nativeFileNeedsHEVC: Bool { isHEVCVideo }
+    var nativeFileNeedsDolbyAudio: Bool { audioStreams.contains { $0.isDolbyAudio } }
 
     /// End of the video stream in media time (seconds from the container start). Audio often runs
     /// past the video; segments must only cover what the video actually contains.
@@ -307,7 +343,10 @@ enum MediaAnalyzer {
                 rotation: ((stream["side_data_list"] as? [[String: Any]])?
                     .first { $0["side_data_type"] as? String == "Display Matrix" }?["rotation"] as? Int) ?? 0,
                 bitRate: (stream["bit_rate"] as? String).flatMap { Int($0) }
-                    ?? ((stream["tags"] as? [String: Any])?["BPS"] as? String).flatMap { Int($0) }
+                    ?? ((stream["tags"] as? [String: Any])?["BPS"] as? String).flatMap { Int($0) },
+                codecTag: (stream["codec_tag_string"] as? String).flatMap { $0.hasPrefix("[") ? nil : $0 },
+                isDefault: ((stream["disposition"] as? [String: Any])?["default"] as? Int) == 1,
+                language: (stream["tags"] as? [String: Any])?["language"] as? String
             )
 
             switch codecType {

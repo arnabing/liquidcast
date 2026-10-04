@@ -145,9 +145,9 @@ struct MenuBarContentView: View {
                 CacheManager.clearAllCache()
             }
 
-            // Devices that once failed HEVC get H.264; let the user retry (e.g. new Apple TV 4K)
-            Button("Retry HEVC/HDR on All Devices") {
-                appState.resetHEVCUnsupportedDevices()
+            // Devices that once failed passthrough get converted streams; let the user retry (e.g. new Apple TV 4K)
+            Button("Retry HDR & Dolby Passthrough on All Devices") {
+                appState.resetPassthroughUnsupportedDevices()
             }
         }
 

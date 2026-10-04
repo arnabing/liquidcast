@@ -24,6 +24,33 @@ enum TranscodeError: LocalizedError {
     }
 }
 
+/// What an Apple TV receiver can be sent untouched
+struct Passthrough: OptionSet, Hashable {
+    let rawValue: Int
+
+    /// HEVC/HDR video (fMP4 segments)
+    static let hevc = Passthrough(rawValue: 1 << 0)
+    /// AC-3/E-AC-3 (incl. Atmos) audio
+    static let dolbyAudio = Passthrough(rawValue: 1 << 1)
+    /// An Apple-native MP4/MOV played directly from the file
+    static let nativeFile = Passthrough(rawValue: 1 << 2)
+
+    static let all: Passthrough = [.hevc, .dolbyAudio, .nativeFile]
+
+    /// When passed-through playback fails, the most likely culprit first: HEVC (e.g. Apple TV HD),
+    /// then playing the file directly, then Dolby audio (which every Apple TV decodes)
+    static let suspicionOrder: [Passthrough] = [.hevc, .nativeFile, .dolbyAudio]
+
+    var name: String {
+        switch self {
+        case .hevc: return "HEVC/HDR"
+        case .dolbyAudio: return "Dolby audio"
+        case .nativeFile: return "direct file playback"
+        default: return "passthrough \(rawValue)"
+        }
+    }
+}
+
 /// Turns a media file into something AirPlay can play: the file itself, or an on-demand HLS stream.
 /// The actual implementation is in platform-specific extensions.
 @MainActor
@@ -44,8 +71,9 @@ class TranscodeManager: ObservableObject {
     @Published var outputAudioChannels: String = ""  // "5.1" or "Stereo"
     @Published var sourceDuration: Double = 0        // Full source file duration from ffprobe
 
-    /// The current stream passes HEVC through (the receiver must decode HEVC)
-    var isHEVCPassthrough = false
+    /// What the current playback passes through untouched. If it fails, `AppState` retries without
+    /// the most likely culprit.
+    var passthroughUsed: Passthrough = []
 
     // MARK: - Streaming (macOS)
 
@@ -67,17 +95,17 @@ class TranscodeManager: ObservableObject {
     ///   - mode: Compatibility mode for target device (Apple TV allows more formats than Smart TVs)
     ///   - startPosition: Resume position in seconds. HLS streams start there by themselves;
     ///     for a returned file URL the caller seeks.
-    ///   - allowHEVC: The receiver decodes HEVC/HDR (Apple TV 4K): pass HEVC through untouched
+    ///   - passthrough: What the receiver accepts untouched (Apple TV: HEVC/HDR, Dolby audio, native files)
     /// - Returns: The file URL itself (directly playable) or an http:// HLS playlist URL
     func prepareForAirPlay(from url: URL, mode: CompatibilityMode = .appleTV, startPosition: Double = 0,
-                           allowHEVC: Bool = false) async throws -> URL {
-        logger.info("🔄 Preparing \(url.lastPathComponent) (mode: \(mode.rawValue), start: \(Int(startPosition))s, HEVC: \(allowHEVC))")
-        return try await performPreparation(from: url, mode: mode, startPosition: startPosition, allowHEVC: allowHEVC)
+                           passthrough: Passthrough = []) async throws -> URL {
+        logger.info("🔄 Preparing \(url.lastPathComponent) (mode: \(mode.rawValue), start: \(Int(startPosition))s, passthrough: \(passthrough.rawValue))")
+        return try await performPreparation(from: url, mode: mode, startPosition: startPosition, passthrough: passthrough)
     }
 
     /// Stop the current stream (kills FFmpeg, deletes its segments)
     func stopStreaming() {
-        isHEVCPassthrough = false
+        passthroughUsed = []
         #if os(macOS)
         preparationGeneration += 1
         if let session = activeSession {

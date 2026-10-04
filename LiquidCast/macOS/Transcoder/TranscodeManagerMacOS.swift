@@ -9,13 +9,14 @@ private let logger = Logger(subsystem: "com.liquidcast", category: "Transcoder")
 /// | Source                                  | Result                                       |
 /// |-----------------------------------------|----------------------------------------------|
 /// | H.264 + AAC in MP4/MOV                  | File URL, played directly                    |
-/// | 8-bit H.264 in MKV/AVI, or + DTS/AC3    | HLS: video stream-copied, audio → AAC        |
+/// | Apple-native MP4/MOV (H.264/HEVC hvc1, AAC/AC-3/E-AC-3), receiver allows passthrough | File URL |
+/// | 8-bit H.264 in MKV/AVI, or + DTS/AC3    | HLS: video stream-copied; audio → AAC (AC-3/E-AC-3 copied for Apple TV) |
 /// | HEVC Main/Main 10, receiver plays HEVC  | HLS (fMP4): video stream-copied, HDR kept    |
 /// | HEVC otherwise, 10-bit, XviD, VP9, ...  | HLS: video → H.264 (VideoToolbox; HDR tone-mapped), audio → AAC |
 extension TranscodeManager {
 
     func performPreparation(from url: URL, mode: CompatibilityMode, startPosition: Double,
-                            allowHEVC: Bool) async throws -> URL {
+                            passthrough: Passthrough) async throws -> URL {
         stopStreaming()
         let generation = preparationGeneration
 
@@ -34,8 +35,15 @@ extension TranscodeManager {
             try ensureCurrent(generation)
             sourceDuration = analysis.duration ?? 0
 
-            if analysis.conversionPath == .directPlayback {
+            // A file the receiver plays as-is needs no FFmpeg at all
+            var nativeNeeds: Passthrough = .nativeFile
+            if analysis.nativeFileNeedsHEVC { nativeNeeds.insert(.hevc) }
+            if analysis.nativeFileNeedsDolbyAudio { nativeNeeds.insert(.dolbyAudio) }
+            let nativeForReceiver = analysis.conversionPath != .directPlayback
+                && analysis.isAppleNativeFile && passthrough.isSuperset(of: nativeNeeds)
+            if analysis.conversionPath == .directPlayback || nativeForReceiver {
                 logger.info("▶️ Direct playback: \(analysis.summary)")
+                passthroughUsed = nativeForReceiver ? nativeNeeds : []
                 updateStreamingInfo(analysis: analysis, profile: nil)
                 finishPreparation(status: "Ready")
                 return url
@@ -48,7 +56,7 @@ extension TranscodeManager {
             sourceDuration = duration  // Match the playlist the player will see
 
             let (profile, plan, variant) = try await makeStream(
-                for: url, analysis: analysis, duration: duration, mode: mode, allowHEVC: allowHEVC,
+                for: url, analysis: analysis, duration: duration, mode: mode, passthrough: passthrough,
                 ffmpegPath: ffmpegPath, ffprobePath: ffprobePath
             )
             try ensureCurrent(generation)
@@ -81,7 +89,9 @@ extension TranscodeManager {
 
             activeSession = session
             sessionRegistry.register(session)
-            isHEVCPassthrough = profile.segmentFormat == .fmp4
+            passthroughUsed = []
+            if profile.segmentFormat == .fmp4 { passthroughUsed.insert(.hevc) }
+            if profile.copiedAudioCodec != nil { passthroughUsed.insert(.dolbyAudio) }
             updateStreamingInfo(analysis: analysis, profile: profile)
             isStreaming = true
             finishPreparation(status: "Streaming")
@@ -175,12 +185,12 @@ extension TranscodeManager {
         analysis: MediaAnalysis,
         duration: Double,
         mode: CompatibilityMode,
-        allowHEVC: Bool,
+        passthrough: Passthrough,
         ffmpegPath: String,
         ffprobePath: String
     ) async throws -> (StreamProfile, SegmentPlan, HLSVariant?) {
         guard var profile = StreamProfile.make(for: analysis, mode: mode, ultraQuality: ultraQualityAudio,
-                                               allowHEVC: allowHEVC) else {
+                                               passthrough: passthrough) else {
             throw TranscodeError.conversionFailed("No video stream found")
         }
 
@@ -190,14 +200,18 @@ extension TranscodeManager {
             if let codec = await hevcCodecString(for: url, videoStreamIndex: profile.videoStreamIndex,
                                                  ffmpegPath: ffmpegPath) {
                 let video = analysis.primaryVideo
-                // What's actually streamed: the copied video plus one AAC track (the file's total
+                // What's actually streamed: the copied video plus one audio track (the file's total
                 // includes every audio track, e.g. TrueHD and other languages)
                 let videoBitRate = video?.bitRate
                     ?? analysis.bitRate
                     ?? Int(Double(analysis.fileSize) * 8 / max(duration, 1))
-                let average = videoBitRate + (profile.audioStreamIndex != nil ? profile.audioBitrateKbps * 1000 : 0)
+                let streamedAudio = analysis.audioStreams.first { $0.index == profile.audioStreamIndex }
+                let audioBitRate = profile.copiedAudioCodec != nil
+                    ? (streamedAudio?.bitRate ?? 768_000)  // Atmos E-AC-3 is usually 768 kbps
+                    : profile.audioBitrateKbps * 1000
+                let average = videoBitRate + (profile.audioStreamIndex != nil ? audioBitRate : 0)
                 variant = HLSVariant(
-                    codecs: [codec] + (profile.audioStreamIndex != nil ? ["mp4a.40.2"] : []),
+                    codecs: [codec] + [profile.audioCodecString].compactMap { $0 },
                     averageBandwidth: average,
                     peakBandwidth: average * 2,  // Apple's VOD allowance: peak ≤ 200% of average
                     width: video?.displaySize?.width,
@@ -208,7 +222,7 @@ extension TranscodeManager {
             } else {
                 logger.warning("Couldn't read the HEVC codec configuration - re-encoding to H.264 instead")
                 guard let fallback = StreamProfile.make(for: analysis, mode: mode, ultraQuality: ultraQualityAudio,
-                                                        allowHEVC: false) else {
+                                                        passthrough: passthrough, forceEncode: true) else {
                     throw TranscodeError.conversionFailed("No video stream found")
                 }
                 profile = fallback
@@ -239,7 +253,7 @@ extension TranscodeManager {
         }
 
         guard let encodeProfile = StreamProfile.make(for: analysis, mode: mode, ultraQuality: ultraQualityAudio,
-                                                     allowHEVC: false, forceEncode: true),
+                                                     passthrough: passthrough, forceEncode: true),
               let plan = SegmentPlan.uniform(duration: duration, segmentLength: StreamProfile.segmentLength) else {
             throw TranscodeError.conversionFailed("Invalid duration")
         }
@@ -274,31 +288,62 @@ extension TranscodeManager {
         statusMessage = status
     }
 
-    /// Update streaming info properties for UI display
+    /// Update streaming info properties for UI display (same labels for direct play and streams)
     private func updateStreamingInfo(analysis: MediaAnalysis, profile: StreamProfile?) {
-        if let width = analysis.primaryVideo?.width {
-            switch width {
-            case 1921...: outputResolution = "4K"
-            case 1281...: outputResolution = "1080p"
-            case 721...: outputResolution = "720p"
-            default: outputResolution = "SD"
-            }
-        } else {
-            outputResolution = ""
+        let video = analysis.primaryVideo
+        let width = profile?.toneMapSize?.width ?? video?.displaySize?.width
+        switch width {
+        case .some(1921...): outputResolution = "4K"
+        case .some(1281...): outputResolution = "1080p"
+        case .some(721...): outputResolution = "720p"
+        case .some: outputResolution = "SD"
+        case .none: outputResolution = ""
         }
 
-        if let profile {
-            if profile.segmentFormat == .fmp4 {
-                outputVideoCodec = analysis.videoRange == .sdr ? "HEVC" : "HEVC \(analysis.videoRange == .pq ? "HDR10" : "HLG")"
-            } else {
-                outputVideoCodec = "H.264"
+        // Video: copied (direct play, or stream copy) keeps the source codec and range
+        let copiedVideo = profile.map { $0.video == .copy } ?? true
+        if copiedVideo && analysis.isHEVCVideo {
+            switch analysis.videoRange {
+            case .sdr: outputVideoCodec = "HEVC"
+            case .pq: outputVideoCodec = video?.dolbyVisionProfile != nil ? "HEVC Dolby Vision" : "HEVC HDR10"
+            case .hlg: outputVideoCodec = "HEVC HLG"
             }
-            outputAudioCodec = "AAC"
-            outputAudioChannels = profile.audioChannels >= 6 ? "5.1" : "Stereo"
+        } else if copiedVideo && !analysis.isH264Video {
+            outputVideoCodec = video?.codecName.uppercased() ?? ""
         } else {
-            outputVideoCodec = analysis.primaryVideo?.codecName.uppercased() ?? ""
-            outputAudioCodec = analysis.primaryAudio?.codecName.uppercased() ?? ""
-            outputAudioChannels = (analysis.primaryAudio?.channels ?? 2) >= 6 ? "5.1" : "Stereo"
+            outputVideoCodec = "H.264"
+        }
+
+        // Audio: copied keeps the source codec (direct play: the default track)
+        let audio = profile.flatMap { p in analysis.audioStreams.first { $0.index == p.audioStreamIndex } } ?? analysis.primaryAudio
+        let copiedAudio = profile.map { $0.copiedAudioCodec != nil } ?? true
+        if copiedAudio, let audio {
+            outputAudioCodec = Self.audioLabel(audio)
+            outputAudioChannels = Self.channelLabel(audio.channels)
+        } else if let profile, profile.audioStreamIndex != nil {
+            outputAudioCodec = "AAC"
+            outputAudioChannels = Self.channelLabel(profile.audioChannels)
+        } else {
+            outputAudioCodec = ""
+            outputAudioChannels = ""
+        }
+    }
+
+    private static func audioLabel(_ audio: StreamInfo) -> String {
+        switch audio.codecName.lowercased() {
+        case "eac3": return audio.profile?.contains("Atmos") == true ? "Atmos" : "E-AC-3"
+        case "ac3": return "AC-3"
+        case "aac": return "AAC"
+        default: return audio.codecName.uppercased()
+        }
+    }
+
+    private static func channelLabel(_ channels: Int?) -> String {
+        switch channels ?? 2 {
+        case 8...: return "7.1"
+        case 6...: return "5.1"
+        case 1: return "Mono"
+        default: return "Stereo"
         }
     }
 

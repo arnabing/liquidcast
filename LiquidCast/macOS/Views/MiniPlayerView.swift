@@ -385,7 +385,7 @@ struct MiniUltraToggle: View {
             .animation(.easeInOut(duration: 0.2), value: appState.ultraQualityEnabled)
         }
         .buttonStyle(.plain)
-        .help(appState.ultraQualityEnabled ? "Ultra: HEVC + 5.1 surround" : "High: H.264 + Stereo")
+        .help(appState.ultraQualityEnabled ? "Ultra: higher bitrates + 5.1 surround" : "High: standard bitrates + stereo")
     }
 }
 

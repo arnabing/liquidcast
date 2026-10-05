@@ -218,7 +218,8 @@ final class LocalHTTPServer: @unchecked Sendable {
             send(.error(405), method: request.method, on: connection)
             return
         }
-        logger.debug("\(request.method, privacy: .public) /\(request.path, privacy: .public)")
+        // Info level so receiver behaviour can be read back later with `log show --info`
+        logger.info("\(request.method, privacy: .public) /\(request.path, privacy: .public)")
         exchange.handlerTask = Task {
             let response = await handler(request)
             guard !Task.isCancelled else { return }
